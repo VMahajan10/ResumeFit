@@ -1,0 +1,21 @@
+{
+  "name": "resumefit-sidebar",
+  "version": "1.0.0",
+  "description": "ResumeFit Sidebar Chrome Extension",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "typescript": "^5.3.0",
+    "vite": "^7.3.0",
+    "vite-plugin-static-copy": "^3.1.4"
+  },
+  "dependencies": {
+    "mammoth": "^1.6.0",
+    "pdfjs-dist": "^5.4.449"
+  }
+}

@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      width: 320px;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+    }
+    h1 {
+      font-size: 18px;
+      margin: 0 0 12px 0;
+      color: #1a1a1a;
+    }
+    .status {
+      padding: 8px;
+      border-radius: 4px;
+      margin-bottom: 12px;
+      font-size: 14px;
+    }
+    .status.success {
+      background-color: #d1fae5;
+      color: #065f46;
+    }
+    .status.error {
+      background-color: #fee2e2;
+      color: #991b1b;
+    }
+    .status.info {
+      background-color: #dbeafe;
+      color: #1e40af;
+    }
+    .config {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid #e5e7eb;
+    }
+    .config label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: #6b7280;
+      margin-bottom: 4px;
+    }
+    .config input {
+      width: 100%;
+      padding: 6px;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      font-size: 14px;
+      box-sizing: border-box;
+    }
+    button {
+      width: 100%;
+      padding: 8px;
+      background-color: #3b82f6;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      margin-top: 8px;
+    }
+    button:hover {
+      background-color: #2563eb;
+    }
+    button:disabled {
+      background-color: #9ca3af;
+      cursor: not-allowed;
+    }
+    button.secondary {
+      background-color: #8b5cf6;
+    }
+    button.secondary:hover {
+      background-color: #7c3aed;
+    }
+    .job-preview {
+      margin-top: 12px;
+      padding: 8px;
+      background-color: #f3f4f6;
+      border-radius: 4px;
+      font-size: 12px;
+      max-height: 150px;
+      overflow-y: auto;
+    }
+    .job-preview-title {
+      font-weight: 600;
+      margin-bottom: 4px;
+      color: #374151;
+    }
+    .job-preview-text {
+      color: #6b7280;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <h1>ResumeFit AI Bridge</h1>
+  <div id="status" class="status info">Ready</div>
+  
+  <button id="testConnection">Test Ollama Connection</button>
+  <button id="scanJob" class="secondary">Scan Job Page</button>
+  
+  <div id="jobPreview" class="job-preview" style="display: none;">
+    <div class="job-preview-title">Extracted Job Description:</div>
+    <div id="jobText" class="job-preview-text"></div>
+  </div>
+
+  <div class="config">
+    <label for="model">Ollama Model:</label>
+    <input type="text" id="model" value="llama3.1" placeholder="llama3.1">
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

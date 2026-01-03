@@ -1,0 +1,8 @@
+# Extension build artifacts
+*.crx
+*.pem
+.DS_Store
+
+# Icons (if you add custom icons later)
+# icon*.png
+

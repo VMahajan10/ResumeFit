@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ResumeFit - Detailed Analysis</title>
+  <link rel="stylesheet" href="analysis.css">
+</head>
+<body>
+  <div class="analysis-container">
+    <!-- Header -->
+    <header class="analysis-header">
+      <div class="header-content">
+        <h1>ResumeFit - Detailed Analysis</h1>
+        <button id="closeAnalysisBtn" class="close-btn" title="Close">×</button>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="analysis-main">
+      <!-- Score Section -->
+      <section class="score-section">
+        <div class="score-circle">
+          <div class="score-value" id="scoreValue">-</div>
+          <div class="score-label">Compatibility Score</div>
+        </div>
+        <div class="score-description" id="scoreDescription"></div>
+      </section>
+
+      <!-- Analysis Sections -->
+      <div class="analysis-grid">
+        <!-- What You Have -->
+        <section class="analysis-card positive">
+          <h2>✅ What You Have</h2>
+          <div class="matched-keywords" id="matchedKeywords">
+            <p class="empty-state">No matched keywords found</p>
+          </div>
+        </section>
+
+        <!-- What's Missing -->
+        <section class="analysis-card negative">
+          <h2>❌ What's Missing</h2>
+          <div class="missing-keywords" id="missingKeywords">
+            <p class="empty-state">No missing keywords found</p>
+          </div>
+        </section>
+      </div>
+
+      <!-- Suggested Edits -->
+      <section class="suggestions-section">
+        <h2>💡 Suggested Improvements</h2>
+        <div class="suggestions-list" id="suggestionsList">
+          <p class="empty-state">No suggestions available</p>
+        </div>
+      </section>
+
+      <!-- Chat Assistant Section -->
+      <section class="chat-section">
+        <div class="chat-header">
+          <h2>💬 Interactive Resume Assistant</h2>
+          <p class="chat-subtitle">Chat with AI to get personalized help improving your resume</p>
+        </div>
+        <div class="chat-container">
+          <div class="chat-messages" id="chatMessages">
+            <div class="chat-message assistant">
+              <div class="message-content">
+                <strong>Assistant:</strong> Hi! I'm here to help you improve your resume based on this job description. What would you like to work on?
+              </div>
+            </div>
+          </div>
+          <div class="chat-input-container">
+            <input type="text" id="chatInput" class="chat-input" placeholder="Ask me anything about improving your resume...">
+            <button id="sendChatBtn" class="send-btn">Send</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Current Resume Draft -->
+      <section class="draft-section">
+        <h2>📄 Current Resume Draft</h2>
+        <div class="draft-preview" id="draftPreview">
+          <p class="empty-state">No resume draft available</p>
+        </div>
+        <div class="draft-actions">
+          <button id="downloadDraftBtn" class="btn btn-primary">Download Resume</button>
+          <button id="copyDraftBtn" class="btn btn-secondary">Copy to Clipboard</button>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script type="module" src="analysis.js"></script>
+</body>
+</html>
+

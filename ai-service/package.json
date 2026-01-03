@@ -1,0 +1,31 @@
+{
+  "name": "resumefit-ai-service",
+  "version": "1.0.0",
+  "description": "Custom AI API service with vector database for ResumeFit",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "setup": "node scripts/setup-vectors.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs",
+    "pm2:stop": "pm2 stop resumefit-ai-service",
+    "pm2:restart": "pm2 restart resumefit-ai-service",
+    "pm2:delete": "pm2 delete resumefit-ai-service",
+    "pm2:logs": "pm2 logs resumefit-ai-service",
+    "pm2:status": "pm2 status"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "chromadb": "^1.8.1",
+    "@xenova/transformers": "^2.17.2",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/cors": "^2.8.17",
+    "@types/node": "^20.11.0"
+  }
+}
+
