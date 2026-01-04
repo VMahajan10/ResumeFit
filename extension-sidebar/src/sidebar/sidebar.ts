@@ -342,17 +342,80 @@ async function parseResumeFile(file: File): Promise<string> {
       
       // Set worker source to use chrome-extension:// URL
       // The worker file should be copied to dist/ during build via vite.config.ts
+      // Clear any existing worker instance first
+      if (typeof globalThis !== 'undefined') {
+        (globalThis as any).pdfjsWorker = null;
+      }
+      
+      // Configure worker - must be done before any PDF operations
+      let workerConfigured = false;
       try {
         const workerUrl = safeGetURL('pdf.worker.min.js');
-        if (workerUrl) {
-          pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+        if (workerUrl && typeof workerUrl === 'string' && workerUrl.length > 0) {
+          // Validate URL format (should be chrome-extension://...)
+          if (workerUrl.startsWith('chrome-extension://') || workerUrl.startsWith('http://') || workerUrl.startsWith('https://')) {
+            // Ensure workerSrc is set as a string (PDF.js v5 requirement)
+            if (typeof pdfjsLib.GlobalWorkerOptions !== 'undefined') {
+              // Clear any existing worker
+              if ((pdfjsLib.GlobalWorkerOptions as any).workerPort) {
+                (pdfjsLib.GlobalWorkerOptions as any).workerPort = null;
+              }
+              // Set the worker source
+              pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+              workerConfigured = true;
+              console.log('[Sidebar] PDF worker configured:', workerUrl);
+            } else {
+              throw new Error('GlobalWorkerOptions not available in PDF.js');
+            }
+          } else {
+            throw new Error(`Invalid worker URL format: ${workerUrl}`);
+          }
         } else {
-          throw new Error('Cannot get worker URL - extension context invalidated');
+          throw new Error('Cannot get worker URL - extension context invalidated or URL is empty');
         }
       } catch (error) {
+        console.warn('[Sidebar] PDF worker setup failed:', error);
         // Fallback: disable worker (runs in main thread - slower but works)
-        console.warn('PDF worker not available, using main thread (slower)');
-        (pdfjsLib.GlobalWorkerOptions as any).workerSrc = false;
+        console.warn('[Sidebar] Using main thread for PDF parsing (slower but functional)');
+        if (typeof pdfjsLib.GlobalWorkerOptions !== 'undefined') {
+          try {
+            (pdfjsLib.GlobalWorkerOptions as any).workerSrc = false;
+            workerConfigured = true;
+          } catch (fallbackError) {
+            console.error('[Sidebar] Failed to disable worker:', fallbackError);
+          }
+        }
+      }
+      
+      // If worker still not configured, try one more time with a direct approach
+      if (!workerConfigured && typeof pdfjsLib.GlobalWorkerOptions !== 'undefined') {
+        try {
+          const workerUrl = safeGetURL('pdf.worker.min.js');
+          if (workerUrl) {
+            // Try setting it directly - PDF.js v5 might need this format
+            const workerSrcValue = String(workerUrl).trim();
+            if (workerSrcValue) {
+              // Clear any existing worker port
+              delete (pdfjsLib.GlobalWorkerOptions as any).workerPort;
+              // Set worker source
+              pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrcValue;
+              console.log('[Sidebar] PDF worker configured (fallback method):', workerSrcValue);
+              workerConfigured = true;
+            }
+          }
+        } catch (e) {
+          console.warn('[Sidebar] Fallback worker configuration failed:', e);
+        }
+      }
+      
+      // Final fallback: disable worker if still not configured
+      if (!workerConfigured && typeof pdfjsLib.GlobalWorkerOptions !== 'undefined') {
+        try {
+          (pdfjsLib.GlobalWorkerOptions as any).workerSrc = false;
+          console.warn('[Sidebar] Using main thread (final fallback - no worker)');
+        } catch (e) {
+          console.error('[Sidebar] Could not configure worker at all:', e);
+        }
       }
 
       const arrayBuffer = await file.arrayBuffer();

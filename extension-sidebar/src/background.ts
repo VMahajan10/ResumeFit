@@ -404,14 +404,18 @@ async function runAnalysis({
   // System prompt that enforces STRICT JSON ONLY output
   const systemPrompt = `You are a resume analysis expert. You MUST provide SPECIFIC, JOB-SPECIFIC suggestions based on the ACTUAL job description and ACTUAL resume content. NO generic advice. Return ONLY valid JSON. No explanations, no markdown, no code blocks, just raw JSON.
 
-CRITICAL REQUIREMENTS:
-1. Read the job description CAREFULLY - identify specific requirements, skills, qualifications, responsibilities
-2. Read the resume CAREFULLY - identify what the candidate actually has
-3. Compare them DIRECTLY - find specific gaps and mismatches
-4. Provide suggestions that DIRECTLY address specific job requirements from the job description
-5. Quote or reference SPECIFIC parts of the job description in your suggestions
-6. Reference SPECIFIC parts of the resume that need to change
-7. NO generic advice like "add a summary" or "quantify achievements" unless it directly addresses a specific job requirement
+CRITICAL REQUIREMENTS - YOU MUST FOLLOW THESE EXACTLY:
+1. Read the job description LINE BY LINE - identify EVERY specific requirement, skill, technology, tool, qualification, responsibility mentioned
+2. Read the resume LINE BY LINE - identify EXACTLY what the candidate has written (quote the exact text)
+3. Compare them DIRECTLY - for each job requirement, find if it exists in the resume and HOW it's worded
+4. For EVERY suggestion, you MUST:
+   a. Quote the EXACT text from the job description (copy it word-for-word)
+   b. Quote the EXACT text from the resume that needs changing (or write "null" if adding new content)
+   c. Write replacement text that INCORPORATES the exact wording/phrases from the job description
+   d. Explain the SPECIFIC connection between the job requirement and the resume change
+5. NO generic advice - EVERY suggestion must reference a SPECIFIC requirement from the job description
+6. If you cannot find a specific job requirement to address, DO NOT create that suggestion
+7. Prioritize suggestions that address REQUIRED qualifications over preferred ones
 
 Return exactly this JSON structure:
 {
@@ -469,52 +473,78 @@ ${keyRequirements}
 ${resumeSections}
 ${resumeText.length > 2000 ? `\n[... ${resumeText.length - 2000} more characters ...]` : ''}
 
-=== ANALYSIS INSTRUCTIONS ===
+=== ANALYSIS INSTRUCTIONS - FOLLOW THESE STEPS EXACTLY ===
 
-STEP 1: Identify SPECIFIC job requirements from the job description above:
-- List each required skill, technology, tool mentioned
-- List required years of experience and type
-- List required qualifications (degrees, certifications)
-- List key responsibilities mentioned
-- List preferred qualifications
+STEP 1: Extract EVERY requirement from the job description (quote exactly):
+Go through the job description line by line and extract:
+- Every technology/tool mentioned (e.g., "Python", "Django", "PostgreSQL", "AWS")
+- Every skill mentioned (e.g., "machine learning", "data analysis", "agile methodology")
+- Every qualification (e.g., "Bachelor's degree in Computer Science", "5+ years experience")
+- Every responsibility (e.g., "design and implement scalable systems", "collaborate with cross-functional teams")
+- Every preferred qualification
 
-STEP 2: Identify what's in the resume:
-- What skills are actually mentioned?
-- What experience is described?
-- What qualifications are listed?
+Create a numbered list of requirements with exact quotes.
 
-STEP 3: Find SPECIFIC gaps:
-- Which specific job requirements are completely missing from the resume?
-- Which job requirements are mentioned but need more detail/emphasis?
-- Which resume experiences could be reframed to better match job requirements?
+STEP 2: Map resume content to job requirements (quote exactly):
+For each requirement from Step 1, check the resume:
+- Does the resume mention this requirement? Quote the exact text from the resume.
+- If mentioned, how is it worded? Is it clear and prominent?
+- If not mentioned, write "NOT FOUND IN RESUME"
 
-STEP 4: Create SPECIFIC suggestions (5-10 total):
-For each suggestion:
-1. Find a SPECIFIC requirement from the job description (quote it exactly)
-2. Find the SPECIFIC resume text that needs to change (quote it exactly, or null if adding new)
-3. Write SPECIFIC replacement text that incorporates the job requirement
-4. Explain the SPECIFIC connection
+STEP 3: Identify SPECIFIC gaps and mismatches:
+For each requirement:
+- If NOT FOUND: This is a HIGH priority gap - create a suggestion to add it
+- If found but vague/weak: This is a MEDIUM priority - create a suggestion to strengthen it
+- If found but in wrong section: This is a MEDIUM priority - create a suggestion to move/emphasize it
+- If found and well-stated: No suggestion needed
 
-CRITICAL: 
-- DO NOT give generic advice like "add a summary" or "quantify achievements"
-- EVERY suggestion MUST reference a SPECIFIC requirement from the job description
-- EVERY suggestion MUST reference SPECIFIC text from the resume (or null if adding)
-- Use the EXACT wording from the job description in your suggestions
+STEP 4: Create SPECIFIC suggestions (minimum 5, maximum 10):
+For EACH suggestion, you MUST provide:
+1. job_requirement: Copy the EXACT text from the job description (from Step 1)
+2. before: Copy the EXACT text from the resume that needs changing (or "null" if adding new)
+3. after: Write replacement text that:
+   - Incorporates the EXACT keywords/phrases from the job requirement
+   - Maintains the resume's existing style and structure
+   - Makes the connection to the job requirement obvious
+4. reason: Explain HOW this specific change addresses the specific job requirement
+5. alignment_impact: Explain how this improves the match score
+6. priority: "high" if required qualification, "medium" if preferred, "low" if nice-to-have
+7. job_keywords_addressed: List the EXACT keywords/phrases from the job description this addresses
 
-EXAMPLE - GOOD:
-Job says: "Required: 5+ years Python experience, Django framework, PostgreSQL"
-Resume says: "Software Engineer, 3 years experience with web development"
+VALIDATION CHECK - Before including a suggestion, ask:
+- Can I quote the exact job requirement? (If no, skip this suggestion)
+- Can I quote the exact resume text to change? (If no, but it's a missing requirement, use "null")
+- Does my "after" text incorporate the exact job requirement wording? (If no, rewrite it)
+- Is this suggestion tied to a SPECIFIC job requirement? (If no, skip it)
+
+EXAMPLE - GOOD (follow this format exactly):
+Job requirement: "Required: 5+ years of Python development experience, Django framework, PostgreSQL database"
+Resume text: "Software Engineer | 3 years | Web development using various technologies"
 Suggestion:
-- job_requirement: "Required: 5+ years Python experience, Django framework, PostgreSQL"
-- before: "Software Engineer, 3 years experience with web development"
-- after: "Software Engineer with 5+ years Python experience, specializing in Django framework and PostgreSQL database development"
-- reason: "Directly addresses the job's specific requirements for Python, Django, and PostgreSQL by explicitly stating these technologies and matching the experience requirement"
+{
+  "job_requirement": "Required: 5+ years of Python development experience, Django framework, PostgreSQL database",
+  "before": "Software Engineer | 3 years | Web development using various technologies",
+  "after": "Software Engineer | 5+ years | Python development with Django framework and PostgreSQL database",
+  "reason": "The job specifically requires '5+ years of Python development experience, Django framework, PostgreSQL database' but the resume only mentions '3 years' and 'various technologies' without naming Python, Django, or PostgreSQL",
+  "alignment_impact": "Explicitly states the required technologies (Python, Django, PostgreSQL) and matches the experience requirement (5+ years), directly addressing three key job requirements",
+  "priority": "high",
+  "job_keywords_addressed": ["5+ years", "Python", "Django", "PostgreSQL"]
+}
 
 EXAMPLE - BAD (DO NOT DO THIS):
-- Generic: "Add a professional summary" (not tied to specific job requirement)
-- Generic: "Quantify your achievements" (not tied to specific job requirement)
+{
+  "job_requirement": "General software development",
+  "before": "Some experience",
+  "after": "Add more details",
+  "reason": "Make it more specific",
+  ...
+}
+This is REJECTED because:
+- job_requirement is too vague (not a real quote from job description)
+- before/after don't quote exact text
+- reason is generic
 
-Now analyze the job description and resume above and provide SPECIFIC suggestions.`;
+Now analyze the job description and resume above. Follow Steps 1-4 exactly. Provide 5-10 SPECIFIC suggestions.`;
 
   try {
     // Use custom AI service if enabled

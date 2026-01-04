@@ -48,6 +48,47 @@ function safeGetURL(path: string): string | null {
 
 // Initialize sidebar
 function initSidebar() {
+  // Check if container already exists in DOM
+  const existingContainer = document.getElementById('resumefit-sidebar-container') as HTMLDivElement;
+  if (existingContainer) {
+    sidebarContainer = existingContainer;
+    // Re-find iframe if it exists
+    sidebarIframe = existingContainer.querySelector('#resumefit-sidebar-iframe') as HTMLIFrameElement;
+    
+    // Verify iframe is valid and has content
+    if (sidebarIframe) {
+      const sidebarUrl = safeGetURL('sidebar.html');
+      if (sidebarUrl && (!sidebarIframe.src || sidebarIframe.src !== sidebarUrl)) {
+        console.log('[ContentScript] Existing container found but iframe src is invalid, reloading...');
+        sidebarIframe.src = sidebarUrl;
+      } else {
+        console.log('[ContentScript] Found existing sidebar container, reusing it');
+        return; // Already initialized and valid
+      }
+    } else {
+      console.log('[ContentScript] Existing container found but iframe missing, recreating iframe...');
+      // Container exists but iframe is missing, create it
+      sidebarIframe = document.createElement('iframe');
+      sidebarIframe.id = 'resumefit-sidebar-iframe';
+      sidebarIframe.style.cssText = `
+        width: 100%;
+        height: 100%;
+        border: none;
+        display: block;
+      `;
+      const sidebarUrl = safeGetURL('sidebar.html');
+      if (sidebarUrl) {
+        sidebarIframe.src = sidebarUrl;
+        sidebarContainer.appendChild(sidebarIframe);
+        observeSidebarVisibility();
+        return;
+      } else {
+        console.error('[ContentScript] Cannot get sidebar URL - extension context invalidated');
+        return;
+      }
+    }
+  }
+  
   if (sidebarContainer) {
     return; // Already initialized
   }
@@ -63,6 +104,7 @@ function initSidebar() {
     height: 100vh;
     z-index: 2147483647;
     display: none;
+    visibility: hidden;
     box-shadow: -2px 0 10px rgba(0, 0, 0, 0.1);
     background: white;
   `;
@@ -94,6 +136,12 @@ function initSidebar() {
 
 // Toggle sidebar visibility
 function toggleSidebar() {
+  // Re-find container if it exists but reference is lost
+  if (!sidebarContainer) {
+    sidebarContainer = document.getElementById('resumefit-sidebar-container') as HTMLDivElement;
+  }
+  
+  // If still not found, initialize it
   if (!sidebarContainer) {
     initSidebar();
   }
@@ -103,11 +151,35 @@ function toggleSidebar() {
   isSidebarVisible = !isSidebarVisible;
 
   if (isSidebarVisible) {
+    // Show sidebar - ensure both display and visibility are set
     sidebarContainer.style.display = 'block';
+    sidebarContainer.style.visibility = 'visible';
+    
+    // Ensure iframe is properly loaded
+    if (sidebarIframe) {
+      // Check if iframe has a valid src
+      const sidebarUrl = safeGetURL('sidebar.html');
+      if (sidebarUrl && (!sidebarIframe.src || sidebarIframe.src !== sidebarUrl)) {
+        console.log('[ContentScript] Reloading sidebar iframe');
+        sidebarIframe.src = sidebarUrl;
+      }
+    } else {
+      // Re-find iframe if reference was lost
+      sidebarIframe = sidebarContainer.querySelector('#resumefit-sidebar-iframe') as HTMLIFrameElement;
+      if (!sidebarIframe) {
+        console.warn('[ContentScript] Sidebar iframe not found, reinitializing...');
+        initSidebar();
+      }
+    }
+    
     adjustPageContent(true);
+    console.log('[ContentScript] Sidebar shown');
   } else {
+    // Hide sidebar
     sidebarContainer.style.display = 'none';
+    sidebarContainer.style.visibility = 'hidden';
     adjustPageContent(false);
+    console.log('[ContentScript] Sidebar hidden');
   }
 }
 

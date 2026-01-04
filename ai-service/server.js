@@ -403,38 +403,93 @@ function generateFallbackResponse(prompt) {
   // Generate suggestions based on actual extracted requirements
   const suggested_edits = [];
   
-  // Add missing technologies (up to 3 most important)
+  // Add missing technologies (up to 3 most important) with specific quotes
   missingTech.slice(0, 3).forEach(tech => {
-    const techLine = jobText.split('\n').find(line => 
+    // Find the exact line in job description that mentions this tech
+    const jobLines = jobText.split('\n');
+    const techLine = jobLines.find(line => 
       line.toLowerCase().includes(tech.toLowerCase())
-    ) || `Required: ${tech}`;
+    );
+    
+    // Get context around the tech mention (the line + next line for full requirement)
+    let jobRequirement = techLine || `Required: ${tech}`;
+    const techLineIndex = jobLines.findIndex(line => 
+      line.toLowerCase().includes(tech.toLowerCase())
+    );
+    if (techLineIndex >= 0 && techLineIndex < jobLines.length - 1) {
+      jobRequirement = jobLines[techLineIndex] + ' ' + jobLines[techLineIndex + 1];
+    }
+    
+    // Find current skills section in resume
+    const resumeLines = resumeText.split('\n');
+    const skillsIndex = resumeLines.findIndex(line => 
+      line.toLowerCase().includes('skill')
+    );
+    let beforeText = null;
+    if (skillsIndex >= 0 && skillsIndex < resumeLines.length) {
+      beforeText = resumeLines[skillsIndex];
+      if (skillsIndex < resumeLines.length - 1) {
+        beforeText += ' ' + resumeLines[skillsIndex + 1];
+      }
+      if (beforeText.length > 150) beforeText = beforeText.substring(0, 150) + '...';
+    }
+    
+    // Capitalize tech name properly
+    const techName = tech.split(' ').map(word => 
+      word.charAt(0).toUpperCase() + word.slice(1)
+    ).join(' ');
     
     suggested_edits.push({
       section: 'skills',
-      before: null,
-      after: `Add ${tech.charAt(0).toUpperCase() + tech.slice(1)} to your skills section`,
-      reason: `The job requires ${tech}, but it's not mentioned in your resume`,
-      job_requirement: techLine.substring(0, 200),
-      alignment_impact: `High - ${tech} is specifically required in the job description`,
+      before: beforeText,
+      after: `Add ${techName} to your skills section. The job description specifically requires: "${jobRequirement.substring(0, 200)}${jobRequirement.length > 200 ? '...' : ''}"`,
+      reason: `The job description states: "${jobRequirement.substring(0, 250)}" - Your resume does not mention ${techName}, which is required for this position`,
+      job_requirement: jobRequirement.substring(0, 300),
+      alignment_impact: `High - ${techName} is specifically required in the job description. Adding it will directly address this requirement`,
       priority: 'high',
-      job_keywords_addressed: [tech]
+      job_keywords_addressed: [tech, techName]
     });
   });
   
-  // Add experience requirement if found
+  // Add experience requirement if found with specific quotes
   if (experienceMatches.length > 0 && resumeText.length > 0) {
     const expReq = experienceMatches[0];
-    const expLine = jobText.split('\n').find(line => line.includes(expReq)) || `Required: ${expReq}`;
+    const jobLines = jobText.split('\n');
+    const expLineIndex = jobLines.findIndex(line => line.includes(expReq));
+    let expLine = expLineIndex >= 0 ? jobLines[expLineIndex] : `Required: ${expReq}`;
+    
+    // Get context around experience requirement
+    if (expLineIndex >= 0 && expLineIndex < jobLines.length - 2) {
+      expLine = jobLines.slice(expLineIndex, expLineIndex + 2).join(' ');
+    }
+    
+    // Find experience section in resume
+    const resumeLines = resumeText.split('\n');
+    const expSectionIndex = resumeLines.findIndex(line => 
+      line.toLowerCase().includes('experience') || 
+      line.toLowerCase().includes('work history') ||
+      line.toLowerCase().includes('employment')
+    );
+    
+    let beforeText = null;
+    if (expSectionIndex >= 0 && expSectionIndex < resumeLines.length - 1) {
+      // Get first experience entry
+      beforeText = resumeLines[expSectionIndex];
+      for (let i = expSectionIndex + 1; i < Math.min(expSectionIndex + 3, resumeLines.length); i++) {
+        beforeText += ' ' + resumeLines[i];
+      }
+      if (beforeText.length > 200) beforeText = beforeText.substring(0, 200) + '...';
+    }
     
     suggested_edits.push({
       section: 'experience',
-      before: null,
-      after: `Ensure your experience section clearly highlights ${expReq} of relevant experience`,
-      reason: `The job requires ${expReq} of experience - make sure this is prominently stated`,
-      job_requirement: expLine.substring(0, 200),
-      alignment_impact: `High - directly addresses the experience requirement`,
+      before: beforeText,
+      after: `Modify your experience section to explicitly state "${expReq}" of relevant experience. The job description requires: "${expLine.substring(0, 200)}${expLine.length > 200 ? '...' : ''}"`,
+      reason: `The job description specifically requires ${expReq} of experience: "${expLine.substring(0, 250)}" - Your resume should prominently state that you meet this requirement`,
+      job_requirement: expLine.substring(0, 300),
+      alignment_impact: `High - directly addresses the experience requirement from the job description. Making this explicit will improve your match score`,
       priority: 'high',
-      job_keywords_addressed: [expReq]
+      job_keywords_addressed: [expReq, 'experience']
     });
   }
   
@@ -442,18 +497,132 @@ function generateFallbackResponse(prompt) {
   const matchRatio = foundInResume.length / Math.max(foundInJob.length, 1);
   const score = Math.min(Math.round(50 + (matchRatio * 40)), 90);
   
-  // If we have good suggestions, use them; otherwise provide helpful message
+  // If we have good suggestions, use them; otherwise extract more specific requirements
   if (suggested_edits.length === 0) {
-    suggested_edits.push({
-      section: 'summary',
-      before: null,
-      after: 'Review the job description and ensure your resume highlights all required skills and experience. Consider adding a professional summary that matches key job requirements.',
-      reason: 'AI analysis timed out, but you can manually review the job requirements against your resume',
-      job_requirement: 'Manual review recommended',
-      alignment_impact: 'Review job description for specific requirements',
-      priority: 'medium',
-      job_keywords_addressed: []
+    // Try to extract more specific requirements from job description
+    const jobLines = jobText.split('\n').filter(l => l.trim().length > 10);
+    const resumeLines = resumeText.split('\n').filter(l => l.trim().length > 5);
+    
+    // Look for specific requirement patterns
+    const requirementPatterns = [
+      /required.*?(\d+)\+?\s*years?/i,
+      /must have.*?([a-z\s]+)/i,
+      /qualifications.*?:/i,
+      /skills.*?:/i,
+      /experience.*?:/i
+    ];
+    
+    // Find specific requirements in job description
+    const specificRequirements = [];
+    jobLines.forEach((line, idx) => {
+      const lowerLine = line.toLowerCase();
+      // Look for requirement keywords
+      if (lowerLine.includes('required') || lowerLine.includes('must') || 
+          lowerLine.includes('qualification') || lowerLine.includes('experience') ||
+          lowerLine.includes('skill') || lowerLine.match(/\d+\+?\s*years?/)) {
+        // Get context (current line + next 2 lines)
+        const context = jobLines.slice(idx, idx + 3).join(' ').trim();
+        if (context.length > 20 && context.length < 300) {
+          specificRequirements.push(context);
+        }
+      }
     });
+    
+    // Check if these requirements are in resume
+    specificRequirements.slice(0, 3).forEach((req, idx) => {
+      const reqLower = req.toLowerCase();
+      // Extract key terms from requirement
+      const keyTerms = reqLower.match(/\b([a-z]{4,})\b/g) || [];
+      const importantTerms = keyTerms.filter(term => 
+        term.length > 4 && 
+        !['required', 'must', 'have', 'qualification', 'experience', 'years', 'with', 'the', 'this', 'that'].includes(term)
+      ).slice(0, 3);
+      
+      // Check if these terms appear in resume
+      const resumeLower = resumeText.toLowerCase();
+      const missingTerms = importantTerms.filter(term => !resumeLower.includes(term));
+      
+      if (missingTerms.length > 0 || idx === 0) {
+        // Find the exact line in resume that might need updating
+        let beforeText = null;
+        let section = 'skills';
+        
+        // Try to find relevant section in resume
+        if (reqLower.includes('experience') || reqLower.includes('years')) {
+          section = 'experience';
+          // Find experience section
+          const expIndex = resumeLines.findIndex(l => 
+            l.toLowerCase().includes('experience') || l.toLowerCase().includes('work')
+          );
+          if (expIndex >= 0 && expIndex < resumeLines.length - 1) {
+            beforeText = resumeLines[expIndex] + ' ' + resumeLines[expIndex + 1];
+            if (beforeText.length > 150) beforeText = beforeText.substring(0, 150) + '...';
+          }
+        } else if (reqLower.includes('skill')) {
+          section = 'skills';
+          const skillIndex = resumeLines.findIndex(l => l.toLowerCase().includes('skill'));
+          if (skillIndex >= 0) {
+            beforeText = resumeLines[skillIndex];
+            if (beforeText.length > 100) beforeText = beforeText.substring(0, 100) + '...';
+          }
+        } else {
+          // Check summary section
+          const summaryIndex = resumeLines.findIndex(l => 
+            l.toLowerCase().includes('summary') || l.toLowerCase().includes('objective')
+          );
+          if (summaryIndex >= 0 && summaryIndex < resumeLines.length - 1) {
+            section = 'summary';
+            beforeText = resumeLines[summaryIndex] + ' ' + resumeLines[summaryIndex + 1];
+            if (beforeText.length > 150) beforeText = beforeText.substring(0, 150) + '...';
+          }
+        }
+        
+        // Create specific suggestion
+        const missingText = missingTerms.length > 0 
+          ? `Missing: ${missingTerms.join(', ')}`
+          : 'Requirement not clearly addressed';
+        
+        suggested_edits.push({
+          section: section,
+          before: beforeText,
+          after: `Incorporate the following requirement: "${req.substring(0, 150)}${req.length > 150 ? '...' : ''}" - Specifically mention: ${importantTerms.slice(0, 3).join(', ')}`,
+          reason: `The job description states: "${req.substring(0, 200)}" - This requirement needs to be explicitly addressed in your ${section} section`,
+          job_requirement: req.substring(0, 300),
+          alignment_impact: `${missingText}. Adding this will directly address a specific job requirement`,
+          priority: missingTerms.length > 0 ? 'high' : 'medium',
+          job_keywords_addressed: importantTerms.slice(0, 5)
+        });
+      }
+    });
+    
+    // If still no suggestions, at least provide one based on the most prominent job requirement
+    if (suggested_edits.length === 0 && jobText.length > 50) {
+      // Find the first substantial requirement line
+      const firstReq = jobLines.find(line => 
+        line.length > 30 && 
+        (line.toLowerCase().includes('required') || 
+         line.toLowerCase().includes('must') ||
+         line.toLowerCase().includes('qualification') ||
+         line.match(/\d+\+?\s*years?/))
+      );
+      
+      if (firstReq) {
+        // Extract key terms
+        const keyTerms = firstReq.match(/\b([A-Z][a-z]+|\d+\+?\s*years?|[A-Z]{2,})\b/g) || [];
+        const importantTerms = keyTerms.slice(0, 5).join(', ');
+        
+        suggested_edits.push({
+          section: 'summary',
+          before: resumeLines[0] || null,
+          after: `Add a professional summary that specifically mentions: ${importantTerms} - directly addressing the job requirement: "${firstReq.substring(0, 150)}${firstReq.length > 150 ? '...' : ''}"`,
+          reason: `The job description requires: "${firstReq.substring(0, 200)}" - Your resume should explicitly state how you meet this requirement`,
+          job_requirement: firstReq.substring(0, 300),
+          alignment_impact: 'High - directly addresses a specific requirement from the job description',
+          priority: 'high',
+          job_keywords_addressed: keyTerms.slice(0, 5)
+        });
+      }
+    }
   }
   
   const response = {
@@ -484,14 +653,18 @@ async function analyzeResume(resumeText, jobText) {
   // Generate analysis prompt
   const systemPrompt = `You are a resume analysis expert. You MUST provide SPECIFIC, JOB-SPECIFIC suggestions based on the ACTUAL job description and ACTUAL resume content. NO generic advice. Return ONLY valid JSON. No explanations, no markdown, no code blocks, just raw JSON.
 
-CRITICAL REQUIREMENTS:
-1. Read the job description CAREFULLY - identify specific requirements, skills, technologies, qualifications, responsibilities
-2. Read the resume CAREFULLY - identify what the candidate actually has
-3. Compare them DIRECTLY - find specific gaps and mismatches
-4. Provide suggestions that DIRECTLY address specific job requirements from the job description
-5. Quote or reference SPECIFIC parts of the job description in your suggestions
-6. Reference SPECIFIC parts of the resume that need to change
-7. NO generic advice like "add a summary" or "quantify achievements" unless it directly addresses a specific job requirement
+CRITICAL REQUIREMENTS - YOU MUST FOLLOW THESE EXACTLY:
+1. Read the job description LINE BY LINE - identify EVERY specific requirement, skill, technology, tool, qualification, responsibility mentioned
+2. Read the resume LINE BY LINE - identify EXACTLY what the candidate has written (quote the exact text)
+3. Compare them DIRECTLY - for each job requirement, find if it exists in the resume and HOW it's worded
+4. For EVERY suggestion, you MUST:
+   a. Quote the EXACT text from the job description (copy it word-for-word)
+   b. Quote the EXACT text from the resume that needs changing (or write "null" if adding new content)
+   c. Write replacement text that INCORPORATES the exact wording/phrases from the job description
+   d. Explain the SPECIFIC connection between the job requirement and the resume change
+5. NO generic advice - EVERY suggestion must reference a SPECIFIC requirement from the job description
+6. If you cannot find a specific job requirement to address, DO NOT create that suggestion
+7. Prioritize suggestions that address REQUIRED qualifications over preferred ones
 
 Return exactly this JSON structure:
 {
@@ -631,21 +804,81 @@ ${resumeStructure.skillsSection ? `Current: "${resumeStructure.skillsSection.sub
 === RESUME TEXT ===
 ${truncatedResumeText}
 
-=== ANALYSIS TASK ===
+=== ANALYSIS INSTRUCTIONS - FOLLOW THESE STEPS EXACTLY ===
 
-Analyze the job description and resume. Provide SPECIFIC suggestions that directly address job requirements.
+STEP 1: Extract EVERY requirement from the job description (quote exactly):
+Go through the job description line by line and extract:
+- Every technology/tool mentioned (e.g., "Python", "Django", "PostgreSQL", "AWS")
+- Every skill mentioned (e.g., "machine learning", "data analysis", "agile methodology")
+- Every qualification (e.g., "Bachelor's degree in Computer Science", "5+ years experience")
+- Every responsibility (e.g., "design and implement scalable systems", "collaborate with cross-functional teams")
+- Every preferred qualification
 
-For each suggestion:
-- section: "summary" | "experience" | "skills"
-- before: exact text from resume (or null if adding)
-- after: improved text incorporating job requirements
-- reason: how this addresses a specific job requirement
-- job_requirement: quote the exact requirement from job description
-- alignment_impact: impact on matching job requirements
-- priority: "high" | "medium" | "low"
-- job_keywords_addressed: [keywords from job description]
+Create a numbered list of requirements with exact quotes.
 
-CRITICAL: Return ONLY valid JSON. No markdown, no explanations. Provide 5-8 specific suggestions.`;
+STEP 2: Map resume content to job requirements (quote exactly):
+For each requirement from Step 1, check the resume:
+- Does the resume mention this requirement? Quote the exact text from the resume.
+- If mentioned, how is it worded? Is it clear and prominent?
+- If not mentioned, write "NOT FOUND IN RESUME"
+
+STEP 3: Identify SPECIFIC gaps and mismatches:
+For each requirement:
+- If NOT FOUND: This is a HIGH priority gap - create a suggestion to add it
+- If found but vague/weak: This is a MEDIUM priority - create a suggestion to strengthen it
+- If found but in wrong section: This is a MEDIUM priority - create a suggestion to move/emphasize it
+- If found and well-stated: No suggestion needed
+
+STEP 4: Create SPECIFIC suggestions (minimum 5, maximum 10):
+For EACH suggestion, you MUST provide:
+1. section: "summary" | "experience" | "skills"
+2. job_requirement: Copy the EXACT text from the job description (from Step 1)
+3. before: Copy the EXACT text from the resume that needs changing (or "null" if adding new)
+4. after: Write replacement text that:
+   - Incorporates the EXACT keywords/phrases from the job requirement
+   - Maintains the resume's existing style and structure
+   - Makes the connection to the job requirement obvious
+5. reason: Explain HOW this specific change addresses the specific job requirement
+6. alignment_impact: Explain how this improves the match score
+7. priority: "high" if required qualification, "medium" if preferred, "low" if nice-to-have
+8. job_keywords_addressed: List the EXACT keywords/phrases from the job description this addresses
+
+VALIDATION CHECK - Before including a suggestion, ask:
+- Can I quote the exact job requirement? (If no, skip this suggestion)
+- Can I quote the exact resume text to change? (If no, but it's a missing requirement, use "null")
+- Does my "after" text incorporate the exact job requirement wording? (If no, rewrite it)
+- Is this suggestion tied to a SPECIFIC job requirement? (If no, skip it)
+
+EXAMPLE - GOOD (follow this format exactly):
+Job requirement: "Required: 5+ years of Python development experience, Django framework, PostgreSQL database"
+Resume text: "Software Engineer | 3 years | Web development using various technologies"
+Suggestion:
+{
+  "section": "experience",
+  "job_requirement": "Required: 5+ years of Python development experience, Django framework, PostgreSQL database",
+  "before": "Software Engineer | 3 years | Web development using various technologies",
+  "after": "Software Engineer | 5+ years | Python development with Django framework and PostgreSQL database",
+  "reason": "The job specifically requires '5+ years of Python development experience, Django framework, PostgreSQL database' but the resume only mentions '3 years' and 'various technologies' without naming Python, Django, or PostgreSQL",
+  "alignment_impact": "Explicitly states the required technologies (Python, Django, PostgreSQL) and matches the experience requirement (5+ years), directly addressing three key job requirements",
+  "priority": "high",
+  "job_keywords_addressed": ["5+ years", "Python", "Django", "PostgreSQL"]
+}
+
+EXAMPLE - BAD (DO NOT DO THIS):
+{
+  "section": "summary",
+  "job_requirement": "General software development",
+  "before": "Some experience",
+  "after": "Add more details",
+  "reason": "Make it more specific",
+  ...
+}
+This is REJECTED because:
+- job_requirement is too vague (not a real quote from job description)
+- before/after don't quote exact text
+- reason is generic
+
+CRITICAL: Return ONLY valid JSON. No markdown, no explanations. Follow Steps 1-4 exactly. Provide 5-10 SPECIFIC suggestions.`;
 
   const response = await generateAIResponse(userPrompt, context);
   
@@ -681,14 +914,20 @@ async function handleChatMessage(message, currentDraft, jobText, chatHistory) {
       context = [];
     }
     
-    const systemPrompt = `You are a resume editing assistant. Help users iteratively improve their resume through conversation.
+    const systemPrompt = `You are a resume editing assistant. Help users iteratively improve their resume through conversation. You MUST provide SPECIFIC, JOB-SPECIFIC suggestions based on the ACTUAL job description and ACTUAL resume content.
 
 CRITICAL RULES:
 1. NO full resume rewrites - only propose incremental changes
-2. Changes must be grounded in the existing resume content
-3. Propose specific, focused edits (1-3 changes per message)
-4. If you need clarification, ask questions and set updated_draft to null
-5. Return ONLY valid JSON - no markdown, no code blocks, no explanations
+2. Changes must be grounded in the existing resume content AND the job description
+3. Propose specific, focused edits (1-3 changes per message) that directly address job requirements
+4. For EVERY edit, you MUST:
+   a. Reference a SPECIFIC requirement from the job description (quote it)
+   b. Quote the EXACT text from the resume that needs changing (or null if adding)
+   c. Write replacement text that incorporates the exact wording from the job requirement
+   d. Explain how this specific change addresses the specific job requirement
+5. If you need clarification, ask questions and set updated_draft to null
+6. Return ONLY valid JSON - no markdown, no code blocks, no explanations
+7. NO generic advice - every suggestion must tie to a specific job requirement
 
 Return exactly this JSON structure:
 {
@@ -696,26 +935,38 @@ Return exactly this JSON structure:
   "proposed_edits": [
     {
       "section": "summary" | "experience" | "skills",
-      "before": "<current text to replace, or null>",
-      "after": "<proposed replacement text>",
-      "reason": "<why this change helps>"
+      "before": "<EXACT current text to replace from resume, or null>",
+      "after": "<proposed replacement text that incorporates EXACT job requirement wording>",
+      "reason": "<explain how this SPECIFIC change addresses a SPECIFIC job requirement - quote the requirement>",
+      "job_requirement": "<quote the EXACT requirement from job description this addresses>"
     }
   ],
   "updated_draft": "<updated resume with ONLY the proposed edits applied, or null if just asking questions>"
 }`;
 
-    const userPrompt = `Current Draft Resume:
+    const userPrompt = `=== CURRENT DRAFT RESUME ===
 ${currentDraft}
 
-Job Description:
+=== JOB DESCRIPTION ===
 ${jobText}
 
-${context.length > 0 ? `Relevant Context:\n${context.join('\n\n---\n\n')}\n` : ''}
+${context.length > 0 ? `=== RELEVANT CONTEXT ===\n${context.join('\n\n---\n\n')}\n` : ''}
 
-Previous Conversation:
+=== PREVIOUS CONVERSATION ===
 ${chatHistory.map(msg => `${msg.role}: ${msg.content}`).join('\n')}
 
-User's current message: ${message}`;
+=== USER'S CURRENT MESSAGE ===
+${message}
+
+=== INSTRUCTIONS ===
+When proposing edits:
+1. Read the user's message to understand what they want
+2. Check the job description for SPECIFIC requirements related to their request
+3. Find the EXACT text in the resume that needs changing (quote it exactly)
+4. Write replacement text that incorporates the EXACT wording from the job description
+5. Explain how your change addresses a SPECIFIC job requirement (quote it)
+
+CRITICAL: Every edit must be tied to a SPECIFIC requirement from the job description. Quote exact text from both documents.`;
 
     // Generate response with chat-specific fallback
     let response;
