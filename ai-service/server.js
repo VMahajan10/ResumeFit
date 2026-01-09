@@ -17,6 +17,13 @@ const USE_OLLAMA = process.env.USE_OLLAMA !== 'false'; // Set to 'false' to disa
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.1';
 
+// Ollama health and retry configuration
+let ollamaHealthy = false;
+const OLLAMA_MAX_RETRIES = 5;
+const OLLAMA_RETRY_DELAY = 2000; // 2 seconds between retries
+const OLLAMA_ANALYSIS_TIMEOUT = 600000; // 10 minutes for analysis (very long, no practical timeout)
+const OLLAMA_CHAT_TIMEOUT = 120000; // 2 minutes for chat
+
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -142,6 +149,212 @@ async function retrieveSimilarContent(queryText, topK = 5) {
 }
 
 /**
+ * Chunk text into meaningful sections for better RAG retrieval
+ */
+function chunkText(text, chunkSize = 500, overlap = 100) {
+  const chunks = [];
+  const sentences = text.split(/[.!?]\s+/).filter(s => s.trim().length > 20);
+  
+  let currentChunk = '';
+  for (const sentence of sentences) {
+    if (currentChunk.length + sentence.length > chunkSize && currentChunk.length > 0) {
+      chunks.push(currentChunk.trim());
+      // Overlap: keep last part of current chunk
+      const words = currentChunk.split(/\s+/);
+      const overlapWords = words.slice(-Math.floor(overlap / 10));
+      currentChunk = overlapWords.join(' ') + ' ' + sentence;
+    } else {
+      currentChunk += (currentChunk ? '. ' : '') + sentence;
+    }
+  }
+  
+  if (currentChunk.trim().length > 0) {
+    chunks.push(currentChunk.trim());
+  }
+  
+  return chunks.length > 0 ? chunks : [text]; // Fallback to full text if chunking fails
+}
+
+/**
+ * Chunk resume into sections (summary, experience, skills, etc.)
+ */
+function chunkResume(resumeText) {
+  const sections = {
+    summary: [],
+    experience: [],
+    skills: [],
+    education: [],
+    projects: [],
+    other: []
+  };
+  
+  const lines = resumeText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  let currentSection = 'other';
+  
+  lines.forEach((line, idx) => {
+    const lowerLine = line.toLowerCase();
+    
+    // Detect section headers
+    if (lowerLine.includes('summary') || lowerLine.includes('objective') || lowerLine.includes('profile')) {
+      currentSection = 'summary';
+    } else if (lowerLine.includes('experience') || lowerLine.includes('work history') || lowerLine.includes('employment')) {
+      currentSection = 'experience';
+    } else if (lowerLine.includes('skill')) {
+      currentSection = 'skills';
+    } else if (lowerLine.includes('education') || lowerLine.includes('degree') || lowerLine.includes('university')) {
+      currentSection = 'education';
+    } else if (lowerLine.includes('project')) {
+      currentSection = 'projects';
+    }
+    
+    // Add to appropriate section
+    if (currentSection !== 'other' || idx < 10) { // First 10 lines might be summary even without header
+      sections[currentSection].push(line);
+    }
+  });
+  
+  // Convert sections to chunks
+  const chunks = [];
+  Object.entries(sections).forEach(([sectionName, sectionLines]) => {
+    if (sectionLines.length > 0) {
+      const sectionText = sectionLines.join(' ');
+      const sectionChunks = chunkText(sectionText, 400, 50);
+      sectionChunks.forEach((chunk, idx) => {
+        chunks.push({
+          text: chunk,
+          section: sectionName,
+          metadata: { type: 'resume_section', section: sectionName, index: idx }
+        });
+      });
+    }
+  });
+  
+  return chunks;
+}
+
+/**
+ * Chunk job description into requirement sections
+ */
+function chunkJobDescription(jobText) {
+  const lines = jobText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const requirementSections = {
+    requirements: [],
+    qualifications: [],
+    skills: [],
+    responsibilities: [],
+    preferred: [],
+    other: []
+  };
+  
+  let currentSection = 'other';
+  
+  lines.forEach((line, idx) => {
+    const lowerLine = line.toLowerCase();
+    
+    // Detect requirement sections
+    if (lowerLine.includes('required') || lowerLine.includes('must have') || lowerLine.includes('requirements')) {
+      currentSection = 'requirements';
+    } else if (lowerLine.includes('qualification')) {
+      currentSection = 'qualifications';
+    } else if (lowerLine.includes('skill')) {
+      currentSection = 'skills';
+    } else if (lowerLine.includes('responsibilit') || lowerLine.includes('duties') || lowerLine.includes('what you')) {
+      currentSection = 'responsibilities';
+    } else if (lowerLine.includes('preferred') || lowerLine.includes('nice to have') || lowerLine.includes('bonus')) {
+      currentSection = 'preferred';
+    }
+    
+    // Get context around requirement lines (current + next 2 lines)
+    if (currentSection !== 'other' || lowerLine.match(/\d+\+?\s*years?/) || lowerLine.length > 30) {
+      const context = lines.slice(Math.max(0, idx - 1), Math.min(lines.length, idx + 3)).join(' ');
+      if (context.length > 30 && context.length < 500) {
+        requirementSections[currentSection].push(context);
+      }
+    }
+  });
+  
+  // Convert to chunks
+  const chunks = [];
+  Object.entries(requirementSections).forEach(([sectionName, sectionTexts]) => {
+    sectionTexts.forEach((text, idx) => {
+      chunks.push({
+        text: text,
+        section: sectionName,
+        metadata: { type: 'job_requirement', section: sectionName, index: idx }
+      });
+    });
+  });
+  
+  return chunks.length > 0 ? chunks : [{ text: jobText, section: 'other', metadata: { type: 'job_description' } }];
+}
+
+/**
+ * Store resume chunks in vector DB
+ */
+async function storeResumeChunks(resumeText, resumeId) {
+  const chunks = chunkResume(resumeText);
+  const stored = [];
+  
+  for (const chunk of chunks) {
+    const success = await storeInVectorDB(chunk.text, {
+      ...chunk.metadata,
+      resumeId: resumeId,
+      timestamp: new Date().toISOString(),
+    });
+    if (success) stored.push(chunk);
+  }
+  
+  return stored;
+}
+
+/**
+ * Store job description chunks in vector DB
+ */
+async function storeJobChunks(jobText, jobId) {
+  const chunks = chunkJobDescription(jobText);
+  const stored = [];
+  
+  for (const chunk of chunks) {
+    const success = await storeInVectorDB(chunk.text, {
+      ...chunk.metadata,
+      jobId: jobId,
+      timestamp: new Date().toISOString(),
+    });
+    if (success) stored.push(chunk);
+  }
+  
+  return stored;
+}
+
+/**
+ * Retrieve relevant resume sections for a job requirement using RAG
+ */
+async function retrieveRelevantResumeSections(jobRequirement, topK = 5) {
+  try {
+    const queryText = `resume section matching job requirement: ${jobRequirement}`;
+    const results = await retrieveSimilarContent(queryText, topK);
+    return results || [];
+  } catch (error) {
+    console.error('Error retrieving relevant resume sections:', error);
+    return [];
+  }
+}
+
+/**
+ * Retrieve relevant job requirements for a resume section using RAG
+ */
+async function retrieveRelevantJobRequirements(resumeSection, topK = 5) {
+  try {
+    const queryText = `job requirement matching resume: ${resumeSection}`;
+    const results = await retrieveSimilarContent(queryText, topK);
+    return results || [];
+  } catch (error) {
+    console.error('Error retrieving relevant job requirements:', error);
+    return [];
+  }
+}
+
+/**
  * Generate AI response for chat (with chat-specific fallback)
  */
 async function generateAIResponseForChat(prompt, context = '') {
@@ -150,55 +363,26 @@ async function generateAIResponseForChat(prompt, context = '') {
     ? `${prompt}\n\nRelevant Context:\n${context}`
     : prompt;
   
-  // Option 1: Try Ollama if enabled
+  // Primary: Ollama (with retries and reasonable timeout for chat)
   if (USE_OLLAMA) {
     try {
-      // Add timeout using AbortController - reduced to 30 seconds for faster fallback
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
-      
-      try {
-        const response = await fetch(`${OLLAMA_URL}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: OLLAMA_MODEL,
-            messages: [{ role: 'user', content: enhancedPrompt }],
-            stream: false,
-          }),
-          signal: controller.signal,
-        });
-        
-        clearTimeout(timeoutId);
-        
-        if (response.ok) {
-          const data = await response.json();
-          return data.message?.content || data.response || '';
-        }
-        
-        // If Ollama returns error, fall through to alternatives
-        console.warn(`Ollama returned ${response.status}, trying alternatives...`);
-      } catch (fetchError) {
-        clearTimeout(timeoutId);
-        if (fetchError.name === 'AbortError') {
-          console.warn('Ollama request timed out after 2 minutes, trying alternatives...');
-        } else {
-          throw fetchError;
-        }
-      }
+      return await callOllamaWithRetry(enhancedPrompt, OLLAMA_CHAT_TIMEOUT);
     } catch (error) {
-      console.warn('Ollama not available, trying alternatives:', error.message);
+      console.error('❌ Ollama failed for chat after all retries:', error.message);
+      // For chat, we can be slightly more lenient but still prefer Ollama
+      console.warn('   Attempting fallback for chat...');
     }
   }
   
-  // Option 2: Use local transformers model
+  // Fallback: Only if Ollama is explicitly disabled or failed after retries
+  // Option 2: Use local transformers model (always try for chat)
   try {
     return await generateWithLocalLLM(enhancedPrompt);
   } catch (error) {
-    console.warn('Local LLM not available, using chat fallback:', error.message);
+    console.warn('Local LLM not available, trying fallback:', error.message);
   }
   
-  // Option 3: Chat-specific fallback
+  // Option 3: Chat-specific fallback (only if all AI options fail)
   // Extract message from prompt for fallback
   const messageMatch = prompt.match(/User's current message:\s*(.+)/);
   const userMessage = messageMatch ? messageMatch[1] : 'user request';
@@ -211,59 +395,118 @@ async function generateAIResponseForChat(prompt, context = '') {
 }
 
 /**
- * Generate AI response using local LLM with RAG
- * 
- * Options:
- * 1. Ollama (if enabled and available)
- * 2. Local transformers model (fully local, no external services)
- * 3. Fallback response (rule-based)
+ * Call Ollama with retry logic and exponential backoff
  */
-async function generateAIResponse(prompt, context = '') {
-  // Enhanced prompt with retrieved context
-  const enhancedPrompt = context 
-    ? `${prompt}\n\nRelevant Context:\n${context}`
-    : prompt;
+async function callOllamaWithRetry(prompt, timeoutMs, retries = OLLAMA_MAX_RETRIES) {
+  const promptLength = prompt.length;
+  console.log(`📤 Calling Ollama (prompt: ${promptLength} chars, timeout: ${Math.round(timeoutMs / 1000)}s)`);
   
-  // Option 1: Try Ollama if enabled
-  if (USE_OLLAMA) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const attemptStartTime = Date.now();
     try {
-      // Add timeout using AbortController - reduced to 30 seconds for faster fallback
+      // Re-check health if previous attempt failed
+      if (attempt > 1 && !ollamaHealthy) {
+        console.log(`🔄 Re-checking Ollama health (attempt ${attempt}/${retries})...`);
+        await checkOllamaHealth(10); // Quick health check
+      }
+      
+      console.log(`🔄 Ollama attempt ${attempt}/${retries}...`);
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      const timeoutId = setTimeout(() => {
+        console.warn(`⏱️  Ollama request timeout approaching (${Math.round(timeoutMs / 1000)}s)...`);
+        controller.abort();
+      }, timeoutMs);
       
       try {
+        const fetchStartTime = Date.now();
         const response = await fetch(`${OLLAMA_URL}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: OLLAMA_MODEL,
-            messages: [{ role: 'user', content: enhancedPrompt }],
+            messages: [{ role: 'user', content: prompt }],
             stream: false,
           }),
           signal: controller.signal,
         });
         
+        const fetchDuration = Math.round((Date.now() - fetchStartTime) / 1000);
+        console.log(`📥 Ollama response received (${fetchDuration}s)`);
+        
         clearTimeout(timeoutId);
         
         if (response.ok) {
+          const parseStartTime = Date.now();
           const data = await response.json();
-          return data.message?.content || data.response || '';
+          const parseDuration = Math.round((Date.now() - parseStartTime) / 1000);
+          
+          const content = data.message?.content || data.response || '';
+          if (content && content.trim().length > 0) {
+            const totalDuration = Math.round((Date.now() - attemptStartTime) / 1000);
+            console.log(`✅ Ollama success (${totalDuration}s total, response: ${content.length} chars)`);
+            ollamaHealthy = true; // Mark as healthy on success
+            return content;
+          } else {
+            throw new Error('Empty response from Ollama');
+          }
+        } else {
+          const errorText = await response.text().catch(() => 'Unknown error');
+          throw new Error(`Ollama returned ${response.status}: ${errorText}`);
         }
-        
-        // If Ollama returns error, fall through to alternatives
-        console.warn(`Ollama returned ${response.status}, trying alternatives...`);
       } catch (fetchError) {
         clearTimeout(timeoutId);
         if (fetchError.name === 'AbortError') {
-          console.warn('Ollama request timed out after 2 minutes, trying alternatives...');
-        } else {
-          throw fetchError;
+          const timeoutSeconds = Math.round(timeoutMs / 1000);
+          const actualDuration = Math.round((Date.now() - attemptStartTime) / 1000);
+          throw new Error(`Request timed out after ${actualDuration} seconds (limit: ${timeoutSeconds}s)`);
         }
+        throw fetchError;
       }
     } catch (error) {
-      console.warn('Ollama not available, trying alternatives:', error.message);
+      const isLastAttempt = attempt === retries;
+      const delay = OLLAMA_RETRY_DELAY * Math.pow(2, attempt - 1); // Exponential backoff
+      const attemptDuration = Math.round((Date.now() - attemptStartTime) / 1000);
+      
+      if (isLastAttempt) {
+        ollamaHealthy = false;
+        console.error(`❌ Ollama failed after ${retries} attempts (last attempt: ${attemptDuration}s)`);
+        throw new Error(`Ollama failed after ${retries} attempts: ${error.message}`);
+      }
+      
+      console.warn(`⚠️  Ollama attempt ${attempt}/${retries} failed after ${attemptDuration}s: ${error.message}`);
+      console.log(`   Retrying in ${delay / 1000} seconds...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
+}
+
+/**
+ * Generate AI response using local LLM with RAG
+ * 
+ * Primary: Ollama (with retries and long timeouts)
+ * Fallback: Only if Ollama is truly unavailable after all retries
+ */
+async function generateAIResponse(prompt, context = '', timeoutMs = OLLAMA_ANALYSIS_TIMEOUT) {
+  // Enhanced prompt with retrieved context
+  const enhancedPrompt = context 
+    ? `${prompt}\n\nRelevant Context:\n${context}`
+    : prompt;
+  
+  // Primary: Ollama (this is what the project is built around)
+  if (USE_OLLAMA) {
+    try {
+      return await callOllamaWithRetry(enhancedPrompt, timeoutMs);
+    } catch (error) {
+      console.error('❌ Ollama failed after all retries:', error.message);
+      console.error('   This service is built around Ollama - please ensure it is running');
+      console.error('   Start Ollama: ollama serve');
+      // Don't fall back immediately - throw error to make it clear Ollama is required
+      throw new Error(`Ollama is required but unavailable: ${error.message}`);
+    }
+  }
+  
+  // Fallback: Only if Ollama is explicitly disabled
+  console.warn('⚠️  Ollama is disabled, using fallback (not recommended)');
   
   // Option 2: Use local transformers model (fully local, no Ollama needed)
   // This is slower but works without any external services
@@ -274,7 +517,7 @@ async function generateAIResponse(prompt, context = '') {
   }
   
   // Option 3: Fallback to rule-based response
-  return generateFallbackResponse(prompt);
+  return await generateFallbackResponse(prompt);
 }
 
 /**
@@ -300,9 +543,9 @@ async function generateWithLocalLLM(prompt) {
       console.log('Local text generation model loaded');
     }
     
-    // Generate response
+    // Generate response (allow more tokens for better chat responses)
     const output = await textGenerationPipeline(prompt, {
-      max_new_tokens: 500,
+      max_new_tokens: 800, // Increased for better chat responses
       temperature: 0.7,
       do_sample: true,
     });
@@ -364,13 +607,69 @@ function generateChatFallbackResponse(message, currentDraft) {
  * Fallback response generator for analysis (when LLM is not available)
  * Tries to extract specific requirements from the prompt
  */
-function generateFallbackResponse(prompt) {
+async function generateFallbackResponse(prompt) {
   // Try to extract job requirements from the prompt
   const jobSectionMatch = prompt.match(/=== JOB DESCRIPTION ===\s*([\s\S]*?)(?=== KEY REQUIREMENTS|=== RESUME|$)/i);
   const resumeMatch = prompt.match(/=== RESUME TEXT ===\s*([\s\S]*?)(?=== ANALYSIS|$)/i);
   
   const jobText = jobSectionMatch ? jobSectionMatch[1].trim().replace(/\[\.\.\. truncated \.\.\.\]/g, '') : '';
   const resumeText = resumeMatch ? resumeMatch[1].trim().replace(/\[\.\.\. truncated \.\.\.\]/g, '') : '';
+  
+  // Use RAG to get relevant sections instead of simple keyword matching
+  let relevantJobRequirements = [];
+  let relevantResumeSections = [];
+  
+  try {
+    // Store chunks for this fallback analysis
+    const sessionId = `fallback_${Date.now()}`;
+    await storeResumeChunks(resumeText, `${sessionId}_resume`);
+    await storeJobChunks(jobText, `${sessionId}_job`);
+    
+    // Extract meaningful requirements from job (not just single words)
+    const jobLines = jobText.split('\n').filter(l => l.trim().length > 30);
+    const meaningfulRequirements = jobLines
+      .filter(line => {
+        const lower = line.toLowerCase();
+        return (lower.includes('required') || lower.includes('must') || 
+                lower.includes('qualification') || lower.includes('experience') ||
+                lower.match(/\d+\+?\s*years?/) || lower.length > 50);
+      })
+      .slice(0, 10);
+    
+    // For each meaningful requirement, use RAG to find relevant resume sections
+    for (const req of meaningfulRequirements) {
+      const relevant = await retrieveRelevantResumeSections(req, 2);
+      if (relevant.length > 0) {
+        relevantJobRequirements.push({
+          requirement: req,
+          relevantResumeSections: relevant
+        });
+      }
+    }
+    
+    // Also find resume sections and match to job requirements
+    const resumeLines = resumeText.split('\n').filter(l => l.trim().length > 20);
+    const keyResumeSections = resumeLines
+      .filter(line => {
+        const lower = line.toLowerCase();
+        return (lower.includes('experience') || lower.includes('skill') || 
+                lower.includes('summary') || lower.includes('project') ||
+                lower.length > 40);
+      })
+      .slice(0, 10);
+    
+    for (const resumeSection of keyResumeSections) {
+      const relevant = await retrieveRelevantJobRequirements(resumeSection, 2);
+      if (relevant.length > 0) {
+        relevantResumeSections.push({
+          resumeSection: resumeSection,
+          relevantJobRequirements: relevant
+        });
+      }
+    }
+  } catch (error) {
+    console.warn('RAG retrieval failed in fallback, using keyword matching:', error.message);
+  }
   
   // Expanded tech keywords list
   const techKeywords = [
@@ -400,13 +699,63 @@ function generateFallbackResponse(prompt) {
   const degreePattern = /(bachelor|master|phd|ph\.d|degree|certification|certified)/gi;
   const degreeMatches = [...new Set(jobText.match(degreePattern) || [])];
   
-  // Generate suggestions based on actual extracted requirements
+  // Generate suggestions based on RAG results first, then fall back to keyword matching
   const suggested_edits = [];
   
-  // Add missing technologies (up to 3 most important) with specific quotes
-  missingTech.slice(0, 3).forEach(tech => {
-    // Find the exact line in job description that mentions this tech
-    const jobLines = jobText.split('\n');
+  // Use RAG results to create specific suggestions
+  if (relevantJobRequirements.length > 0) {
+    relevantJobRequirements.slice(0, 5).forEach((ragResult, idx) => {
+      const req = ragResult.requirement;
+      const relevantResumeSections = ragResult.relevantResumeSections;
+      
+      // Extract key terms from requirement (only meaningful words, not single characters)
+      const reqWords = req.split(/\s+/).filter(w => w.length > 3 && !['the', 'and', 'with', 'that', 'this'].includes(w.toLowerCase()));
+      const keyTerms = reqWords.slice(0, 5);
+      
+      // Check if these terms are actually in the resume sections
+      const resumeTextLower = relevantResumeSections.join(' ').toLowerCase();
+      const missingTerms = keyTerms.filter(term => !resumeTextLower.includes(term.toLowerCase()));
+      
+      if (missingTerms.length > 0 || idx < 2) {
+        // Determine section
+        let section = 'skills';
+        const reqLower = req.toLowerCase();
+        if (reqLower.includes('experience') || reqLower.includes('years')) {
+          section = 'experience';
+        } else if (reqLower.includes('skill') || reqLower.includes('proficient') || reqLower.includes('expert')) {
+          section = 'skills';
+        } else {
+          section = 'summary';
+        }
+        
+        // Find the relevant resume section text
+        let beforeText = null;
+        if (relevantResumeSections.length > 0) {
+          beforeText = relevantResumeSections[0].substring(0, 200);
+        }
+        
+        suggested_edits.push({
+          section: section,
+          before: beforeText,
+          after: `Update to explicitly address: "${req.substring(0, 200)}${req.length > 200 ? '...' : ''}" - Specifically mention: ${keyTerms.slice(0, 3).join(', ')}`,
+          reason: `The job description requires: "${req.substring(0, 250)}" - Your resume should explicitly address this requirement`,
+          job_requirement: req.substring(0, 300),
+          alignment_impact: `High - directly addresses a specific requirement from the job description`,
+          priority: 'high',
+          job_keywords_addressed: keyTerms.slice(0, 5)
+        });
+      }
+    });
+  }
+  
+  // Fall back to keyword matching only if RAG didn't provide enough suggestions
+  if (suggested_edits.length < 3) {
+    // Add missing technologies (up to 3 most important) with specific quotes
+    // Only use tech keywords that are actually meaningful (length > 3)
+    const meaningfulTech = missingTech.filter(tech => tech.length > 3);
+    meaningfulTech.slice(0, 3).forEach(tech => {
+      // Find the exact line in job description that mentions this tech
+      const jobLines = jobText.split('\n');
     const techLine = jobLines.find(line => 
       line.toLowerCase().includes(tech.toLowerCase())
     );
@@ -449,7 +798,8 @@ function generateFallbackResponse(prompt) {
       priority: 'high',
       job_keywords_addressed: [tech, techName]
     });
-  });
+    });
+  }
   
   // Add experience requirement if found with specific quotes
   if (experienceMatches.length > 0 && resumeText.length > 0) {
@@ -640,15 +990,87 @@ function generateFallbackResponse(prompt) {
  * Analyze resume with RAG
  */
 async function analyzeResume(resumeText, jobText) {
-  // Store job description in vector DB for future reference
-  await storeInVectorDB(jobText, {
-    type: 'job_description',
-    timestamp: new Date().toISOString(),
-  });
+  // Constants for limiting context size
+  const MAX_RAG_CONTEXT = 1000; // Limit RAG context to 1000 chars total
   
-  // Retrieve similar job descriptions for context
-  const similarJobs = await retrieveSimilarContent(jobText, 3);
-  const context = similarJobs.join('\n\n---\n\n');
+  // Generate unique IDs for this analysis session
+  const sessionId = `session_${Date.now()}`;
+  const resumeId = `${sessionId}_resume`;
+  const jobId = `${sessionId}_job`;
+  
+  // Store resume and job chunks in vector DB for RAG
+  const resumeChunks = await storeResumeChunks(resumeText, resumeId);
+  const jobChunks = await storeJobChunks(jobText, jobId);
+  
+  // Use RAG to retrieve relevant sections
+  // For each major job requirement, find relevant resume sections
+  const relevantContexts = [];
+  
+  // Extract key requirements from job description
+  const jobRequirementKeywords = [
+    'required', 'must have', 'qualifications', 'skills', 'experience', 
+    'years', 'degree', 'certification', 'proficient', 'expert'
+  ];
+  
+  const jobLines = jobText.split('\n').filter(l => l.trim().length > 20);
+  const keyJobRequirements = jobLines
+    .filter(line => jobRequirementKeywords.some(kw => line.toLowerCase().includes(kw)))
+    .slice(0, 10); // Top 10 requirement lines
+  
+  // For each key requirement, retrieve relevant resume sections using RAG
+  for (const requirement of keyJobRequirements) {
+    const relevantResumeSections = await retrieveRelevantResumeSections(requirement, 3);
+    if (relevantResumeSections.length > 0) {
+      relevantContexts.push({
+        jobRequirement: requirement,
+        relevantResumeSections: relevantResumeSections.join('\n')
+      });
+    }
+  }
+  
+  // Also retrieve relevant job requirements for key resume sections
+  const resumeSectionKeywords = ['experience', 'skill', 'summary', 'education', 'project'];
+  const keyResumeSections = resumeText.split('\n')
+    .filter(l => l.trim().length > 20)
+    .filter(line => resumeSectionKeywords.some(kw => line.toLowerCase().includes(kw)))
+    .slice(0, 10);
+  
+  for (const resumeSection of keyResumeSections) {
+    const relevantJobRequirements = await retrieveRelevantJobRequirements(resumeSection, 3);
+    if (relevantJobRequirements.length > 0) {
+      relevantContexts.push({
+        resumeSection: resumeSection,
+        relevantJobRequirements: relevantJobRequirements.join('\n')
+      });
+    }
+  }
+  
+  // Build context string from RAG results
+  const context = relevantContexts.length > 0
+    ? relevantContexts.map(ctx => {
+        if (ctx.jobRequirement) {
+          return `Job Requirement: "${ctx.jobRequirement}"\nRelevant Resume Sections:\n${ctx.relevantResumeSections}`;
+        } else {
+          return `Resume Section: "${ctx.resumeSection}"\nRelevant Job Requirements:\n${ctx.relevantJobRequirements}`;
+        }
+      }).join('\n\n---\n\n')
+    : '';
+  
+  // Also retrieve similar job descriptions for additional context
+  // Limit RAG context to prevent huge prompts
+  const limitedContext = context.length > MAX_RAG_CONTEXT 
+    ? context.substring(0, MAX_RAG_CONTEXT) + '\n[... RAG context truncated ...]'
+    : context;
+  
+  const similarJobs = await retrieveSimilarContent(jobText, 1); // Reduced from 2 to 1
+  const similarJobsContext = similarJobs.length > 0 
+    ? `\n\nSimilar Job Descriptions for Reference:\n${similarJobs[0].substring(0, 500)}${similarJobs[0].length > 500 ? '...' : ''}`
+    : '';
+  
+  // Limit total context to prevent huge prompts
+  const fullContext = (limitedContext + similarJobsContext).length > MAX_RAG_CONTEXT * 2
+    ? (limitedContext + similarJobsContext).substring(0, MAX_RAG_CONTEXT * 2) + '\n[... context truncated ...]'
+    : limitedContext + similarJobsContext;
   
   // Generate analysis prompt
   const systemPrompt = `You are a resume analysis expert. You MUST provide SPECIFIC, JOB-SPECIFIC suggestions based on the ACTUAL job description and ACTUAL resume content. NO generic advice. Return ONLY valid JSON. No explanations, no markdown, no code blocks, just raw JSON.
@@ -714,20 +1136,38 @@ CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no c
   const keyRequirements = extractJobRequirements(jobText);
   const resumeSections = resumeText.split('\n').filter(l => l.trim().length > 0).slice(0, 20).join('\n');
 
-  // Analyze resume structure
+  // Enhanced resume structure analysis with detailed work experience and project parsing
   const analyzeResumeStructure = (resumeText) => {
     const lines = resumeText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
     const structure = {
       hasSummary: false,
       summaryText: '',
       experienceEntries: [],
+      detailedExperiences: [], // Enhanced: detailed work experience objects
       skillsSection: '',
       educationSection: '',
       projectsSection: '',
+      detailedProjects: [], // Enhanced: detailed project objects
     };
     
     let currentSection = '';
     let currentEntry = '';
+    let currentExperience = null;
+    let currentProject = null;
+    
+    // Common tech keywords for extraction
+    const techKeywords = [
+      'python', 'javascript', 'java', 'typescript', 'react', 'node', 'angular', 'vue',
+      'django', 'flask', 'spring', 'express', 'sql', 'postgresql', 'mongodb', 'mysql',
+      'aws', 'azure', 'gcp', 'docker', 'kubernetes', 'git', 'github', 'ci/cd',
+      'machine learning', 'ml', 'ai', 'data science', 'tensorflow', 'pytorch'
+    ];
+    
+    // Extract technologies from text
+    const extractTechnologies = (text) => {
+      const lower = text.toLowerCase();
+      return techKeywords.filter(tech => lower.includes(tech.toLowerCase()));
+    };
     
     lines.forEach((line, idx) => {
       const lowerLine = line.toLowerCase();
@@ -737,25 +1177,100 @@ CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no c
         currentSection = 'summary';
         structure.hasSummary = true;
         structure.summaryText = line;
+        if (currentExperience) {
+          structure.detailedExperiences.push(currentExperience);
+          currentExperience = null;
+        }
+        if (currentProject) {
+          structure.detailedProjects.push(currentProject);
+          currentProject = null;
+        }
       } else if (lowerLine.includes('experience') || lowerLine.includes('work history') || lowerLine.includes('employment')) {
         currentSection = 'experience';
+        if (currentExperience) {
+          structure.detailedExperiences.push(currentExperience);
+        }
+        currentExperience = { title: '', company: '', dates: '', description: '', technologies: [] };
       } else if (lowerLine.includes('skill')) {
         currentSection = 'skills';
+        if (currentExperience) {
+          structure.detailedExperiences.push(currentExperience);
+          currentExperience = null;
+        }
+        if (currentProject) {
+          structure.detailedProjects.push(currentProject);
+          currentProject = null;
+        }
       } else if (lowerLine.includes('education') || lowerLine.includes('degree') || lowerLine.includes('university')) {
         currentSection = 'education';
+        if (currentExperience) {
+          structure.detailedExperiences.push(currentExperience);
+          currentExperience = null;
+        }
+        if (currentProject) {
+          structure.detailedProjects.push(currentProject);
+          currentProject = null;
+        }
       } else if (lowerLine.includes('project')) {
         currentSection = 'projects';
+        if (currentExperience) {
+          structure.detailedExperiences.push(currentExperience);
+          currentExperience = null;
+        }
+        if (currentProject) {
+          structure.detailedProjects.push(currentProject);
+        }
+        currentProject = { name: '', description: '', technologies: [] };
       }
       
-      // Collect content by section
+      // Collect content by section with enhanced parsing
       if (currentSection === 'summary' && idx < 10) {
         structure.summaryText += ' ' + line;
       } else if (currentSection === 'experience') {
-        if (line.match(/^\d{4}|\w+\s+\d{4}|present|current/i)) {
-          if (currentEntry) structure.experienceEntries.push(currentEntry.trim());
+        // Enhanced: Parse work experience entries in detail
+        if (line.match(/^\d{4}|\w+\s+\d{4}|present|current|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec/i)) {
+          if (currentEntry) {
+            structure.experienceEntries.push(currentEntry.trim());
+            if (currentExperience) {
+              currentExperience.description = currentEntry.trim();
+              currentExperience.technologies = extractTechnologies(currentEntry);
+            }
+          }
           currentEntry = line;
+          
+          // Try to extract job title and company from the line
+          if (currentExperience) {
+            // Common patterns: "Software Engineer | Company Name | 2020-2024"
+            const parts = line.split('|').map(p => p.trim());
+            if (parts.length >= 2) {
+              currentExperience.title = parts[0];
+              currentExperience.company = parts[1];
+              if (parts.length >= 3) {
+                currentExperience.dates = parts[2];
+              }
+            } else {
+              // Try other patterns
+              const dateMatch = line.match(/(\d{4}|\w+\s+\d{4}|present|current)/i);
+              if (dateMatch) {
+                currentExperience.dates = dateMatch[0];
+                const beforeDate = line.substring(0, dateMatch.index).trim();
+                const titleCompany = beforeDate.split(/[|•\-]/).map(p => p.trim()).filter(p => p);
+                if (titleCompany.length >= 1) currentExperience.title = titleCompany[0];
+                if (titleCompany.length >= 2) currentExperience.company = titleCompany[1];
+              }
+            }
+          }
         } else if (currentEntry) {
           currentEntry += ' ' + line;
+          if (currentExperience) {
+            currentExperience.description += ' ' + line;
+            const techs = extractTechnologies(line);
+            techs.forEach(tech => {
+              if (!currentExperience.technologies.includes(tech)) {
+                currentExperience.technologies.push(tech);
+              }
+            });
+          }
         }
       } else if (currentSection === 'skills') {
         structure.skillsSection += ' ' + line;
@@ -763,10 +1278,33 @@ CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no c
         structure.educationSection += ' ' + line;
       } else if (currentSection === 'projects') {
         structure.projectsSection += ' ' + line;
+        // Enhanced: Parse project details
+        if (currentProject) {
+          if (!currentProject.name && line.length < 100 && !line.match(/^\d{4}/)) {
+            // Likely project name
+            currentProject.name = line;
+          } else {
+            currentProject.description += (currentProject.description ? ' ' : '') + line;
+            const techs = extractTechnologies(line);
+            techs.forEach(tech => {
+              if (!currentProject.technologies.includes(tech)) {
+                currentProject.technologies.push(tech);
+              }
+            });
+          }
+        }
       }
     });
     
-    if (currentEntry) structure.experienceEntries.push(currentEntry.trim());
+    if (currentEntry) {
+      structure.experienceEntries.push(currentEntry.trim());
+    }
+    if (currentExperience) {
+      structure.detailedExperiences.push(currentExperience);
+    }
+    if (currentProject) {
+      structure.detailedProjects.push(currentProject);
+    }
     
     return structure;
   };
@@ -774,9 +1312,11 @@ CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no c
   const resumeStructure = analyzeResumeStructure(resumeText);
   
   // Truncate inputs to prevent timeout - keep essential info but limit length
-  const MAX_JOB_TEXT = 2000; // Limit job description to 2000 chars
-  const MAX_RESUME_TEXT = 3000; // Limit resume to 3000 chars
-  const MAX_KEY_REQUIREMENTS = 1000; // Limit key requirements
+  const MAX_JOB_TEXT = 1500; // Limit job description to 1500 chars (reduced from 2000)
+  const MAX_RESUME_TEXT = 2000; // Limit resume to 2000 chars (reduced from 3000)
+  const MAX_KEY_REQUIREMENTS = 500; // Limit key requirements (reduced from 1000)
+  const MAX_EXPERIENCE_DESC = 150; // Limit each work experience description
+  const MAX_PROJECT_DESC = 150; // Limit each project description
   
   const truncatedJobText = jobText.length > MAX_JOB_TEXT 
     ? jobText.substring(0, MAX_JOB_TEXT) + '\n[... truncated ...]'
@@ -788,60 +1328,103 @@ CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no c
     ? keyRequirements.substring(0, MAX_KEY_REQUIREMENTS) + '\n[... truncated ...]'
     : keyRequirements;
 
-  const userPrompt = `=== JOB DESCRIPTION ===
+  const userPrompt = `You are a strict resume–job alignment evaluator.
+
+Your task is to analyze a JOB_DESCRIPTION and a RESUME and produce precise, evidence-based feedback.
+
+=== JOB DESCRIPTION (may contain UI noise) ===
 ${truncatedJobText}
 
-=== KEY REQUIREMENTS ===
+=== KEY REQUIREMENTS EXTRACTED ===
 ${truncatedKeyRequirements}
 
 === RESUME STRUCTURE ===
 Summary: ${resumeStructure.hasSummary ? 'EXISTS' : 'MISSING'}
 ${resumeStructure.hasSummary ? `Current: "${resumeStructure.summaryText.substring(0, 150)}"` : ''}
-Experience: ${resumeStructure.experienceEntries.length} entries
+
+Work Experience: ${resumeStructure.experienceEntries.length} entries
+${resumeStructure.detailedExperiences && resumeStructure.detailedExperiences.length > 0 ? `\nDETAILED WORK EXPERIENCES (showing max 5 most recent):\n${resumeStructure.detailedExperiences.slice(0, 5).map((exp, idx) => 
+  `${idx + 1}. ${exp.title || 'Title N/A'} at ${exp.company || 'Company N/A'} (${exp.dates || 'Dates N/A'})\n   Technologies: ${exp.technologies && exp.technologies.length > 0 ? exp.technologies.slice(0, 5).join(', ') : 'None identified'}${exp.technologies && exp.technologies.length > 5 ? '...' : ''}\n   Description: "${(exp.description || '').substring(0, MAX_EXPERIENCE_DESC)}${(exp.description || '').length > MAX_EXPERIENCE_DESC ? '...' : ''}"`
+).join('\n\n')}` : ''}
+
+Projects: ${resumeStructure.detailedProjects && resumeStructure.detailedProjects.length > 0 ? resumeStructure.detailedProjects.length : 0} projects identified
+${resumeStructure.detailedProjects && resumeStructure.detailedProjects.length > 0 ? `\nDETAILED PROJECTS (showing max 3 most relevant):\n${resumeStructure.detailedProjects.slice(0, 3).map((proj, idx) => 
+  `${idx + 1}. ${proj.name || 'Project N/A'}\n   Technologies: ${proj.technologies && proj.technologies.length > 0 ? proj.technologies.slice(0, 5).join(', ') : 'None identified'}${proj.technologies && proj.technologies.length > 5 ? '...' : ''}\n   Description: "${(proj.description || '').substring(0, MAX_PROJECT_DESC)}${(proj.description || '').length > MAX_PROJECT_DESC ? '...' : ''}"`
+).join('\n\n')}` : ''}
+
 Skills: ${resumeStructure.skillsSection ? 'EXISTS' : 'MISSING'}
 ${resumeStructure.skillsSection ? `Current: "${resumeStructure.skillsSection.substring(0, 150)}"` : ''}
 
 === RESUME TEXT ===
 ${truncatedResumeText}
 
-=== ANALYSIS INSTRUCTIONS - FOLLOW THESE STEPS EXACTLY ===
+=== NON-NEGOTIABLE RULES ===
 
-STEP 1: Extract EVERY requirement from the job description (quote exactly):
-Go through the job description line by line and extract:
-- Every technology/tool mentioned (e.g., "Python", "Django", "PostgreSQL", "AWS")
-- Every skill mentioned (e.g., "machine learning", "data analysis", "agile methodology")
-- Every qualification (e.g., "Bachelor's degree in Computer Science", "5+ years experience")
-- Every responsibility (e.g., "design and implement scalable systems", "collaborate with cross-functional teams")
-- Every preferred qualification
+1. Treat JOB_DESCRIPTION as raw scraped text that may contain UI noise.
+   - Ignore and NEVER treat as skills or requirements any UI or boilerplate terms such as:
+     "Apply now", "opens in a new window", "About", "Less", "More", "Show more", navigation labels, or buttons.
+   - If you detect UI noise, list it in the "Ignored Noise" section.
 
-Create a numbered list of requirements with exact quotes.
+2. You may ONLY recommend a skill, keyword, or experience if:
+   - It appears explicitly in the JOB_DESCRIPTION (quote it exactly, ≤20 words), AND
+   - It is a real professional skill, technology, research area, or domain concept, AND
+   - It is missing or weakly represented in the RESUME.
 
-STEP 2: Map resume content to job requirements (quote exactly):
-For each requirement from Step 1, check the resume:
-- Does the resume mention this requirement? Quote the exact text from the resume.
-- If mentioned, how is it worded? Is it clear and prominent?
+3. Every recommendation MUST be justified with evidence:
+   - Quote the exact phrase from the JOB_DESCRIPTION (≤20 words).
+   - Quote the relevant portion of the RESUME or explicitly state "no evidence found."
+
+4. If the JOB_DESCRIPTION is vague, repetitive, or noisy, say so explicitly and limit recommendations accordingly.
+
+5. Do NOT give generic advice (e.g., "tailor your resume", "highlight impact").
+
+6. Do NOT infer requirements that are not stated in the JOB_DESCRIPTION.
+
+=== ANALYSIS STEPS ===
+
+STEP 1: Filter UI noise from job description
+- Identify and list all UI/boilerplate terms (e.g., "Apply now", "opens in a new window", "Less", "More", navigation elements)
+- These will be IGNORED in all analysis
+
+STEP 2: Extract REAL requirements from job description (quote exactly, ≤20 words each)
+- Only extract technologies, skills, qualifications, responsibilities that are:
+  - Explicitly stated in the job description
+  - Real professional skills/technologies (not UI elements)
+  - Not in the ignored noise list
+- Create a numbered list with exact quotes (≤20 words each)
+
+STEP 3: Map resume content to job requirements (quote exactly)
+For each requirement from Step 2, check:
+- Is it mentioned in work experience? Quote the EXACT work experience entry and line
+- Is it mentioned in projects? Quote the EXACT project description
+- Is it mentioned in skills section? Quote the EXACT text
 - If not mentioned, write "NOT FOUND IN RESUME"
 
-STEP 3: Identify SPECIFIC gaps and mismatches:
+STEP 4: Identify alignment gaps (evidence-based only)
 For each requirement:
-- If NOT FOUND: This is a HIGH priority gap - create a suggestion to add it
-- If found but vague/weak: This is a MEDIUM priority - create a suggestion to strengthen it
-- If found but in wrong section: This is a MEDIUM priority - create a suggestion to move/emphasize it
-- If found and well-stated: No suggestion needed
+- If NOT FOUND in resume: This is a gap (only if it's a real requirement from Step 2)
+- If found but vague/weak: This is a gap (only if you can quote evidence)
+- If found and well-stated: No gap
 
-STEP 4: Create SPECIFIC suggestions (minimum 5, maximum 10):
+STEP 5: Create suggestions (minimum 3, maximum 10, only if evidence supports)
 For EACH suggestion, you MUST provide:
-1. section: "summary" | "experience" | "skills"
-2. job_requirement: Copy the EXACT text from the job description (from Step 1)
+1. section: "experience" | "projects" | "skills" | "summary"
+2. job_requirement: Copy the EXACT text from the job description (≤20 words, from Step 2)
 3. before: Copy the EXACT text from the resume that needs changing (or "null" if adding new)
 4. after: Write replacement text that:
    - Incorporates the EXACT keywords/phrases from the job requirement
-   - Maintains the resume's existing style and structure
-   - Makes the connection to the job requirement obvious
-5. reason: Explain HOW this specific change addresses the specific job requirement
-6. alignment_impact: Explain how this improves the match score
+   - Uses similar phrasing/wording from the job description
+   - Maintains the resume's existing style
+   - For work experience: Shows how to reformat existing experience to match job requirements
+5. reason: Explain HOW this specific change addresses the specific job requirement, with evidence quotes
+6. alignment_impact: Explain how this improves alignment with evidence
 7. priority: "high" if required qualification, "medium" if preferred, "low" if nice-to-have
-8. job_keywords_addressed: List the EXACT keywords/phrases from the job description this addresses
+8. job_keywords_addressed: List the EXACT keywords/phrases from the job description (≤20 words total)
+
+QUALITY BAR:
+- If you cannot find at least 3 meaningful gaps supported by evidence, explain why instead of inventing feedback
+- Do NOT create suggestions without evidence quotes
+- Do NOT recommend skills/technologies that are not explicitly in the job description
 
 VALIDATION CHECK - Before including a suggestion, ask:
 - Can I quote the exact job requirement? (If no, skip this suggestion)
@@ -850,18 +1433,22 @@ VALIDATION CHECK - Before including a suggestion, ask:
 - Is this suggestion tied to a SPECIFIC job requirement? (If no, skip it)
 
 EXAMPLE - GOOD (follow this format exactly):
-Job requirement: "Required: 5+ years of Python development experience, Django framework, PostgreSQL database"
-Resume text: "Software Engineer | 3 years | Web development using various technologies"
+Job requirement: "Required: 5+ years of Python development experience, Django framework, PostgreSQL database, experience designing and implementing scalable web applications"
+Resume work experience: "Software Engineer | Tech Corp | 2020-2023
+- Developed web applications using various technologies
+- Built REST APIs and managed databases
+- Worked on improving application performance"
+
 Suggestion:
 {
   "section": "experience",
-  "job_requirement": "Required: 5+ years of Python development experience, Django framework, PostgreSQL database",
-  "before": "Software Engineer | 3 years | Web development using various technologies",
-  "after": "Software Engineer | 5+ years | Python development with Django framework and PostgreSQL database",
-  "reason": "The job specifically requires '5+ years of Python development experience, Django framework, PostgreSQL database' but the resume only mentions '3 years' and 'various technologies' without naming Python, Django, or PostgreSQL",
-  "alignment_impact": "Explicitly states the required technologies (Python, Django, PostgreSQL) and matches the experience requirement (5+ years), directly addressing three key job requirements",
+  "job_requirement": "Required: 5+ years of Python development experience, Django framework, PostgreSQL database, experience designing and implementing scalable web applications",
+  "before": "Software Engineer | Tech Corp | 2020-2023\n- Developed web applications using various technologies\n- Built REST APIs and managed databases\n- Worked on improving application performance",
+  "after": "Software Engineer | Tech Corp | 2020-2023 (5+ years)\n- Designed and implemented scalable web applications using Python and Django framework\n- Built REST APIs with Django REST framework and managed PostgreSQL databases\n- Optimized application performance and database queries for scalability",
+  "reason": "The job requires '5+ years of Python development experience, Django framework, PostgreSQL database, experience designing and implementing scalable web applications'. The resume mentions relevant work but doesn't specify Python, Django, PostgreSQL, or use the job's exact phrasing 'designed and implemented scalable web applications'. Reformatting the work experience to include these specific technologies and job description wording directly addresses the requirement.",
+  "alignment_impact": "Explicitly states the required technologies (Python, Django, PostgreSQL) using job description wording, matches the experience requirement (5+ years), and uses the exact phrase 'designed and implemented scalable web applications' from the job description, directly addressing all key job requirements",
   "priority": "high",
-  "job_keywords_addressed": ["5+ years", "Python", "Django", "PostgreSQL"]
+  "job_keywords_addressed": ["5+ years", "Python", "Django", "PostgreSQL", "designed and implemented scalable web applications"]
 }
 
 EXAMPLE - BAD (DO NOT DO THIS):
@@ -878,21 +1465,89 @@ This is REJECTED because:
 - before/after don't quote exact text
 - reason is generic
 
-CRITICAL: Return ONLY valid JSON. No markdown, no explanations. Follow Steps 1-4 exactly. Provide 5-10 SPECIFIC suggestions.`;
+CRITICAL: 
+- Return ONLY valid JSON matching the OUTPUT FORMAT above
+- No markdown, no code blocks, no explanations outside JSON
+- Follow all NON-NEGOTIABLE RULES strictly
+- Ignore UI noise (list in ignored_noise)
+- Only recommend skills/requirements explicitly in job description
+- Provide evidence quotes for every recommendation
+- Minimum 3 gaps if evidence supports, otherwise explain why
+- Maximum 10 suggestions
+- Skills section: max 18 total skills, grouped by category`;
 
-  const response = await generateAIResponse(userPrompt, context);
+  // Use very long timeout for analysis (10 minutes) - Ollama should never timeout
+  const response = await generateAIResponse(userPrompt, fullContext, OLLAMA_ANALYSIS_TIMEOUT);
   
   // Extract JSON from response
   let jsonText = response.trim();
+  // Remove markdown code blocks if present
+  jsonText = jsonText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
   const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
     jsonText = jsonMatch[0];
   }
   
   try {
-    return JSON.parse(jsonText);
+    const parsed = JSON.parse(jsonText);
+    
+    // Transform new format to expected format for backward compatibility
+    // New format: { top_alignment_gaps, resume_edits, skills_section, ignored_noise }
+    // Expected format: { score, matched_keywords, missing_keywords, suggested_edits, updated_draft }
+    
+    if (parsed.resume_edits && Array.isArray(parsed.resume_edits)) {
+      // New format detected - transform it
+      const suggested_edits = parsed.resume_edits.map(edit => ({
+        section: edit.section || 'experience',
+        before: edit.before || null,
+        after: edit.after || '',
+        reason: edit.reason || '',
+        job_requirement: edit.job_requirement || '',
+        alignment_impact: edit.alignment_impact || '',
+        priority: edit.priority || 'medium',
+        job_keywords_addressed: edit.job_keywords_addressed || []
+      }));
+      
+      // Extract keywords from gaps and edits
+      const missing_keywords = [];
+      const matched_keywords = [];
+      
+      if (parsed.top_alignment_gaps && Array.isArray(parsed.top_alignment_gaps)) {
+        parsed.top_alignment_gaps.forEach(gap => {
+          // Extract keywords from evidence
+          const evidence = gap.evidence_from_job || '';
+          const keywords = evidence.split(/\s+/).filter(w => w.length > 2 && !['the', 'and', 'or', 'with', 'for'].includes(w.toLowerCase()));
+          missing_keywords.push(...keywords.slice(0, 5));
+        });
+      }
+      
+      // Calculate score based on gaps and edits
+      const gapCount = parsed.top_alignment_gaps ? parsed.top_alignment_gaps.length : 0;
+      const editCount = suggested_edits.length;
+      const score = Math.max(0, Math.min(100, 100 - (gapCount * 10) - (editCount * 5)));
+      
+      return {
+        score: score,
+        matched_keywords: matched_keywords,
+        missing_keywords: [...new Set(missing_keywords)],
+        suggested_edits: suggested_edits,
+        updated_draft: resumeText,
+        // Include new format fields for future use
+        top_alignment_gaps: parsed.top_alignment_gaps || [],
+        skills_section: parsed.skills_section || {},
+        ignored_noise: parsed.ignored_noise || []
+      };
+    } else if (parsed.suggested_edits) {
+      // Old format - return as is
+      return parsed;
+    } else {
+      // Unknown format - try to construct from available data
+      throw new Error('Unexpected response format from AI');
+    }
   } catch (error) {
-    throw new Error('Invalid JSON response from AI');
+    console.error('Error parsing AI response:', error);
+    console.error('Response was:', response.substring(0, 500));
+    throw new Error('Invalid JSON response from AI: ' + error.message);
   }
 }
 
@@ -901,16 +1556,23 @@ CRITICAL: Return ONLY valid JSON. No markdown, no explanations. Follow Steps 1-4
  */
 async function handleChatMessage(message, currentDraft, jobText, chatHistory) {
   try {
-    // Retrieve relevant context from vector DB (with error handling)
+    // Retrieve relevant context from vector DB (allow more time for better results)
     let context = [];
     try {
       const queryText = `${message} ${jobText}`;
-      context = await retrieveSimilarContent(queryText, 3);
+      // Add timeout to RAG retrieval - max 10 seconds (allow time for better context)
+      const ragPromise = retrieveSimilarContent(queryText, 5); // Get more results for better AI context
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('RAG timeout')), 10000)
+      );
+      
+      context = await Promise.race([ragPromise, timeoutPromise]);
       if (!Array.isArray(context)) {
         context = [];
       }
     } catch (error) {
-      console.warn('Error retrieving context from vector DB:', error.message);
+      // If RAG times out, continue without it but log the warning
+      console.warn('RAG retrieval timed out, continuing without context:', error.message);
       context = [];
     }
     
@@ -944,16 +1606,31 @@ Return exactly this JSON structure:
   "updated_draft": "<updated resume with ONLY the proposed edits applied, or null if just asking questions>"
 }`;
 
+    // Truncate inputs but keep more context for better AI responses
+    const maxDraftLength = 3000; // Increased for better AI understanding
+    const maxJobLength = 2000; // Increased for better AI understanding
+    const maxHistoryLength = 1000; // Increased for better context
+    
+    const truncatedDraft = currentDraft.length > maxDraftLength 
+      ? currentDraft.substring(0, maxDraftLength) + '[...]'
+      : currentDraft;
+    const truncatedJob = jobText.length > maxJobLength
+      ? jobText.substring(0, maxJobLength) + '[...]'
+      : jobText;
+    const truncatedHistory = chatHistory.length > 10
+      ? chatHistory.slice(-10).map(msg => `${msg.role}: ${msg.content.substring(0, 200)}`).join('\n')
+      : chatHistory.map(msg => `${msg.role}: ${msg.content}`).join('\n');
+
     const userPrompt = `=== CURRENT DRAFT RESUME ===
-${currentDraft}
+${truncatedDraft}
 
 === JOB DESCRIPTION ===
-${jobText}
+${truncatedJob}
 
-${context.length > 0 ? `=== RELEVANT CONTEXT ===\n${context.join('\n\n---\n\n')}\n` : ''}
+${context.length > 0 ? `=== RELEVANT CONTEXT ===\n${context.slice(0, 5).join('\n\n---\n\n')}\n` : ''}
 
 === PREVIOUS CONVERSATION ===
-${chatHistory.map(msg => `${msg.role}: ${msg.content}`).join('\n')}
+${truncatedHistory}
 
 === USER'S CURRENT MESSAGE ===
 ${message}
@@ -966,17 +1643,31 @@ When proposing edits:
 4. Write replacement text that incorporates the EXACT wording from the job description
 5. Explain how your change addresses a SPECIFIC job requirement (quote it)
 
-CRITICAL: Every edit must be tied to a SPECIFIC requirement from the job description. Quote exact text from both documents.`;
+CRITICAL: Every edit must be tied to a SPECIFIC requirement from the job description. Quote exact text from both documents. Keep response concise.`;
 
-    // Generate response with chat-specific fallback
+    // Generate response using AI (always wait for AI, no fast fallback)
     let response;
     try {
       const contextText = Array.isArray(context) ? context.join('\n\n') : '';
+      // Use full prompt for better AI responses (don't truncate)
       response = await generateAIResponseForChat(userPrompt, contextText);
+      
+      // If response is empty or invalid, retry once
+      if (!response || response.trim().length === 0) {
+        console.warn('Empty AI response, retrying...');
+        response = await generateAIResponseForChat(userPrompt, contextText);
+      }
     } catch (error) {
-      console.error('Error generating AI response:', error);
-      // Fall back to chat fallback response
-      return generateChatFallbackResponse(message, currentDraft);
+      console.error('Error generating AI response, retrying once:', error.message);
+      // Retry once before giving up
+      try {
+        const contextText = Array.isArray(context) ? context.join('\n\n') : '';
+        response = await generateAIResponseForChat(userPrompt, contextText);
+      } catch (retryError) {
+        console.error('AI response failed after retry, using fallback:', retryError.message);
+        // Only use fallback as last resort
+        return generateChatFallbackResponse(message, currentDraft);
+      }
     }
     
     if (!response || typeof response !== 'string') {
@@ -1039,31 +1730,150 @@ app.get('/health', (req, res) => {
 });
 
 /**
+ * Get analysis status (check if analysis is in progress)
+ */
+app.get('/api/analysis/status', (req, res) => {
+  if (activeAnalysisRequest) {
+    const duration = activeAnalysisRequestStartTime 
+      ? Math.round((Date.now() - activeAnalysisRequestStartTime) / 1000)
+      : null;
+    res.json({
+      inProgress: true,
+      requestId: activeAnalysisRequest,
+      durationSeconds: duration,
+    });
+  } else {
+    res.json({
+      inProgress: false,
+      requestId: null,
+      durationSeconds: null,
+    });
+  }
+});
+
+/**
+ * Reset analysis state (clear stuck requests)
+ * Use with caution - only if a request is truly stuck
+ */
+app.post('/api/analysis/reset', (req, res) => {
+  const previousRequestId = activeAnalysisRequest;
+  activeAnalysisRequest = null;
+  activeAnalysisRequestStartTime = null;
+  console.warn(`⚠️  Analysis state reset. Previous request ID: ${previousRequestId || 'none'}`);
+  res.json({
+    success: true,
+    message: 'Analysis state cleared',
+    previousRequestId: previousRequestId,
+  });
+});
+
+// Request deduplication - prevent multiple concurrent analyses
+let activeAnalysisRequest = null;
+let activeAnalysisRequestStartTime = null;
+
+/**
  * Analyze resume endpoint
  */
 app.post('/api/analyze', async (req, res) => {
+  const startTime = Date.now();
+  const requestId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  console.log(`📊 Analysis request received [${requestId}]`);
+  
+  // Check if there's already an active analysis
+  if (activeAnalysisRequest) {
+    const duration = activeAnalysisRequestStartTime 
+      ? Math.round((Date.now() - activeAnalysisRequestStartTime) / 1000)
+      : null;
+    console.warn(`⚠️  Analysis already in progress [${activeAnalysisRequest}] (running for ${duration}s), rejecting request [${requestId}]`);
+    
+    // Auto-clear if request has been running for more than 20 minutes (likely stuck)
+    if (duration && duration > 1200) {
+      console.warn(`⚠️  Auto-clearing stuck request [${activeAnalysisRequest}] (running for ${duration}s)`);
+      activeAnalysisRequest = null;
+      activeAnalysisRequestStartTime = null;
+    } else {
+      return res.status(429).json({
+        success: false,
+        error: `Analysis already in progress. Please wait for the current analysis to complete. (Running for ${duration || 'unknown'} seconds)`,
+        requestId: activeAnalysisRequest,
+        durationSeconds: duration,
+      });
+    }
+  }
+  
   try {
     const { resumeText, jobText } = req.body;
+    activeAnalysisRequest = requestId;
+    activeAnalysisRequestStartTime = Date.now();
     
     if (!resumeText || !jobText) {
+      console.error('❌ Missing required fields');
+      activeAnalysisRequest = null;
+      activeAnalysisRequestStartTime = null;
       return res.status(400).json({
         success: false,
         error: 'Both resumeText and jobText are required',
       });
     }
     
-    const result = await analyzeResume(resumeText, jobText);
+    console.log(`📝 Resume length: ${resumeText.length} chars, Job length: ${jobText.length} chars [${requestId}]`);
+    console.log('🤖 Starting analysis with Ollama...');
     
-    res.json({
-      success: true,
-      result,
+    // Set a timeout for the entire HTTP request (15 minutes max)
+    const requestTimeout = setTimeout(() => {
+      if (!res.headersSent) {
+        console.error(`⏱️  Request timeout after 15 minutes [${requestId}]`);
+        activeAnalysisRequest = null; // Clear active request
+        activeAnalysisRequestStartTime = null;
+        res.status(504).json({
+          success: false,
+          error: 'Analysis timed out after 15 minutes. The request may be too complex or Ollama may be overloaded.',
+        });
+      }
+    }, 900000); // 15 minutes
+    
+    // Safety: Clear active request if client disconnects
+    req.on('close', () => {
+      if (activeAnalysisRequest === requestId) {
+        console.warn(`⚠️  Client disconnected, clearing active request [${requestId}]`);
+        activeAnalysisRequest = null;
+        activeAnalysisRequestStartTime = null;
+        clearTimeout(requestTimeout);
+      }
     });
+    
+    try {
+      const result = await analyzeResume(resumeText, jobText);
+      clearTimeout(requestTimeout);
+      
+      const duration = Math.round((Date.now() - startTime) / 1000);
+      console.log(`✅ Analysis completed successfully in ${duration} seconds [${requestId}]`);
+      
+      activeAnalysisRequest = null; // Clear active request
+      activeAnalysisRequestStartTime = null;
+      res.json({
+        success: true,
+        result,
+      });
+    } catch (analysisError) {
+      clearTimeout(requestTimeout);
+      activeAnalysisRequest = null; // Clear active request on error
+      activeAnalysisRequestStartTime = null;
+      throw analysisError;
+    }
   } catch (error) {
-    console.error('Analysis error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Analysis failed',
-    });
+    activeAnalysisRequest = null; // Clear active request on error
+    activeAnalysisRequestStartTime = null;
+    const duration = Math.round((Date.now() - startTime) / 1000);
+    console.error(`❌ Analysis error after ${duration} seconds [${requestId}]:`, error);
+    console.error('Error stack:', error.stack);
+    
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: error.message || 'Analysis failed',
+      });
+    }
   }
 });
 
@@ -1149,16 +1959,78 @@ app.post('/api/store', async (req, res) => {
   }
 });
 
+/**
+ * Check Ollama health and wait for it to be ready
+ */
+async function checkOllamaHealth(maxWaitSeconds = 30) {
+  const startTime = Date.now();
+  const maxWait = maxWaitSeconds * 1000;
+  
+  while (Date.now() - startTime < maxWait) {
+    try {
+      const response = await fetch(`${OLLAMA_URL}/api/tags`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(5000), // 5 second timeout for health check
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        // Check if the model is available
+        const modelAvailable = data.models?.some(m => 
+          m.name === OLLAMA_MODEL || m.name.startsWith(OLLAMA_MODEL + ':')
+        );
+        
+        if (modelAvailable) {
+          ollamaHealthy = true;
+          console.log(`✅ Ollama is healthy and model '${OLLAMA_MODEL}' is available`);
+          return true;
+        } else {
+          console.warn(`⚠️  Ollama is running but model '${OLLAMA_MODEL}' not found. Available models:`, 
+            data.models?.map(m => m.name).join(', ') || 'none');
+          // Still mark as healthy if Ollama is responding
+          ollamaHealthy = true;
+          return true;
+        }
+      }
+    } catch (error) {
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      console.log(`⏳ Waiting for Ollama... (${elapsed}s/${maxWaitSeconds}s)`);
+      await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds before retry
+    }
+  }
+  
+  ollamaHealthy = false;
+  console.error(`❌ Ollama not available after ${maxWaitSeconds} seconds`);
+  return false;
+}
+
 // Initialize and start server
 async function startServer() {
   try {
     // Initialize embedding model
     await initializeEmbeddingModel();
     
-    // Test vector DB connection
+    // Check Ollama health and wait for it (critical for this project)
+    if (USE_OLLAMA) {
+      console.log('🔍 Checking Ollama health...');
+      await checkOllamaHealth(30); // Wait up to 30 seconds for Ollama
+      if (!ollamaHealthy) {
+        console.error('❌ CRITICAL: Ollama is not available. This service requires Ollama to function properly.');
+        console.error('   Please ensure Ollama is running: ollama serve');
+        console.error('   Or install it: https://ollama.ai');
+        console.error('   Service will continue but may have limited functionality.');
+      }
+    }
+    
+    // Test vector DB connection with timeout
     try {
-      // Test ChromaDB connection
-      await chromaClient.heartbeat();
+      // Test ChromaDB connection with 5 second timeout
+      const heartbeatPromise = chromaClient.heartbeat();
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Connection timeout')), 5000)
+      );
+      
+      await Promise.race([heartbeatPromise, timeoutPromise]);
       chromaAvailable = true;
       await getOrCreateCollection();
       console.log('✅ Vector database (ChromaDB) connected');
@@ -1171,7 +2043,7 @@ async function startServer() {
     
     // Display configuration
     console.log('\n📋 Configuration:');
-    console.log(`   Ollama: ${USE_OLLAMA ? '✅ Enabled' : '❌ Disabled (using local models only)'}`);
+    console.log(`   Ollama: ${USE_OLLAMA ? (ollamaHealthy ? '✅ Healthy' : '❌ Not available') : '❌ Disabled'}`);
     if (USE_OLLAMA) {
       console.log(`   Ollama URL: ${OLLAMA_URL}`);
       console.log(`   Ollama Model: ${OLLAMA_MODEL}`);

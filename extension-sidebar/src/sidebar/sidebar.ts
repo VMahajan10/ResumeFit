@@ -25,6 +25,8 @@ let state: ExtensionState = {
 // Track active timeouts to prevent orphaned timeouts
 let analysisTimeoutId: number | null = null;
 let jobExtractionTimeoutId: number | null = null;
+// Track if analysis is in progress to prevent multiple concurrent requests
+let isAnalysisInProgress = false;
 
 // Check if extension context is still valid
 function isExtensionContextValid(): boolean {
@@ -485,10 +487,19 @@ function updateDraftResume() {
  * Handle run analysis - Calls Ollama API via background script
  */
 async function handleRunAnalysis() {
+  // Prevent multiple concurrent analysis requests
+  if (isAnalysisInProgress) {
+    showStatus('Analysis already in progress. Please wait for it to complete.', 'info');
+    return;
+  }
+
   if (!state.jobText || !state.resumeText) {
     showStatus('Please extract job description and save resume text first', 'error');
     return;
   }
+
+  // Mark analysis as in progress
+  isAnalysisInProgress = true;
 
   // Clear any existing timeout from previous analysis attempts
   if (analysisTimeoutId !== null) {
@@ -499,7 +510,7 @@ async function handleRunAnalysis() {
   // Disable button and show loading state
   elements.runAnalysisBtn.disabled = true;
   elements.runAnalysisBtn.textContent = 'Analyzing...';
-  showStatus('Running analysis with Ollama...', 'info');
+  showStatus('Running analysis with Ollama... This may take several minutes. Please wait...', 'info');
 
   try {
     const message: MessagePayload = {
@@ -539,13 +550,22 @@ async function handleRunAnalysis() {
             showStatus('Analysis complete!', 'success');
           } else {
             // Show friendly error message
-            const errorMsg =
-              response.error ||
-              'Ollama not running. Please install and run Ollama, then run: ollama pull llama3.1';
-            showStatus(errorMsg, 'error');
+            const errorMsg = response.error || 'Analysis failed';
+            
+            // Handle 429 (too many requests) specifically
+            if (errorMsg.includes('already in progress') || errorMsg.includes('429')) {
+              showStatus('Analysis is already running on the server. Please wait for it to complete before trying again.', 'info');
+              // Clear our local flag since this request was rejected
+              isAnalysisInProgress = false;
+            } else {
+              // Clear in-progress flag for other errors
+              isAnalysisInProgress = false;
+              showStatus(errorMsg, 'error');
+            }
           }
 
-          // Re-enable button
+          // Re-enable button and clear in-progress flag
+          isAnalysisInProgress = false;
           elements.runAnalysisBtn.disabled = false;
           elements.runAnalysisBtn.textContent = 'Run Analysis';
           resolve();
@@ -554,18 +574,21 @@ async function handleRunAnalysis() {
 
       window.addEventListener('message', handler);
 
-      // Timeout after 60 seconds - store the timeout ID
+      // Timeout after 15 minutes (900 seconds) to match server timeout
+      // Server allows up to 15 minutes for analysis
       analysisTimeoutId = window.setTimeout(() => {
         analysisTimeoutId = null; // Clear the ID
+        isAnalysisInProgress = false; // Clear in-progress flag
         window.removeEventListener('message', handler);
         elements.runAnalysisBtn.disabled = false;
         elements.runAnalysisBtn.textContent = 'Run Analysis';
-        showStatus('Analysis timed out. Please try again.', 'error');
+        showStatus('Analysis timed out after 15 minutes. The request may be too complex or Ollama may be overloaded.', 'error');
         resolve();
-      }, 60000);
+      }, 900000); // 15 minutes (900000ms)
     });
   } catch (error) {
-    // Clear timeout on error
+    // Clear timeout and in-progress flag on error
+    isAnalysisInProgress = false;
     if (analysisTimeoutId !== null) {
       clearTimeout(analysisTimeoutId);
       analysisTimeoutId = null;
@@ -1095,10 +1118,68 @@ function updateUI() {
 }
 
 /**
+ * Clear state from storage
+ */
+async function clearState() {
+  try {
+    // Reset local state
+    state = {
+      jobText: '',
+      jobUrl: '',
+      resumeText: '',
+      chatHistory: [],
+      currentDraft: '',
+      draftVersions: [],
+    };
+    
+    // Reset UI to empty state
+    elements.resumeText.value = '';
+    elements.resumeText.style.display = 'none';
+    elements.saveResumeBtn.style.display = 'none';
+    elements.uploadText.textContent = 'Upload Resume (PDF, DOCX, or TXT)';
+    elements.jobInfo.style.display = 'none';
+    elements.draftResume.textContent = 'No draft available';
+    elements.chatMessages.innerHTML = '<div style="color: #6b7280; text-align: center; padding: 20px;">No messages yet. Start a conversation!</div>';
+    elements.chatInput.value = '';
+    
+    // Hide analysis results
+    elements.scoreSection.style.display = 'none';
+    elements.missingKeywordsSection.style.display = 'none';
+    elements.suggestedEditsSection.style.display = 'none';
+    elements.proposedEditsSection.style.display = 'none';
+    
+    // Clear analysis result
+    state.analysisResult = undefined;
+    state.pendingEdits = undefined;
+    
+    // Clear from chrome.storage.local
+    const message: MessagePayload = {
+      type: 'CLEAR_STATE',
+    };
+    
+    window.parent.postMessage(message, '*');
+    
+    // Also try direct chrome.storage if available
+    if (isExtensionContextValid() && typeof chrome !== 'undefined' && chrome.storage) {
+      chrome.storage.local.remove(['resumeFitState'], () => {
+        console.log('[Sidebar] State cleared from storage');
+      });
+    }
+    
+    console.log('[Sidebar] State and UI cleared');
+  } catch (error) {
+    console.error('Failed to clear state:', error);
+  }
+}
+
+/**
  * Close sidebar
  */
 function closeSidebar() {
   console.log('[Sidebar] closeSidebar called');
+  
+  // Clear state when closing
+  clearState();
   
   const message: MessagePayload = {
     type: 'CLOSE_SIDEBAR',

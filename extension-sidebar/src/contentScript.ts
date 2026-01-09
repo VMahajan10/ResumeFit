@@ -366,6 +366,7 @@ window.addEventListener('message', (event) => {
       message.type === 'EXTRACT_JOB_TEXT' ||
       message.type === 'SAVE_STATE' ||
       message.type === 'LOAD_STATE' ||
+      message.type === 'CLEAR_STATE' ||
       message.type === 'GET_TAB_URL' ||
       message.type === 'RUN_ANALYSIS' ||
       message.type === 'CHAT_MESSAGE'

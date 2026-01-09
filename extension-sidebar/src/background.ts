@@ -147,6 +147,14 @@ chrome.runtime.onMessage.addListener(
       return true;
     }
 
+    // Handle state clear
+    if (message.type === 'CLEAR_STATE') {
+      chrome.storage.local.remove(['resumeFitState'], () => {
+        sendResponse({ success: true });
+      });
+      return true;
+    }
+
     // Handle get current tab URL
     if (message.type === 'GET_TAB_URL') {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
