@@ -465,7 +465,8 @@ CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no c
       }
     });
     
-    return requirements.length > 0 ? requirements.join('\n') : jobText.substring(0, 1000);
+    // Return all requirements or full job text if no specific requirements found
+    return requirements.length > 0 ? requirements.join('\n') : jobText;
   };
 
   const keyRequirements = extractJobRequirements(jobText);

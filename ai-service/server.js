@@ -990,15 +990,15 @@ async function generateFallbackResponse(prompt) {
  * Analyze resume with RAG
  */
 async function analyzeResume(resumeText, jobText) {
-  // Constants for limiting context size
-  const MAX_RAG_CONTEXT = 1000; // Limit RAG context to 1000 chars total
+  // Dynamic approach: No hardcoded limits - use intelligent extraction and RAG
+  // The full job text is always stored in RAG, and we intelligently extract what's needed for the prompt
   
   // Generate unique IDs for this analysis session
   const sessionId = `session_${Date.now()}`;
   const resumeId = `${sessionId}_resume`;
   const jobId = `${sessionId}_job`;
   
-  // Store resume and job chunks in vector DB for RAG
+  // Store resume and job chunks in vector DB for RAG (full text, no limits)
   const resumeChunks = await storeResumeChunks(resumeText, resumeId);
   const jobChunks = await storeJobChunks(jobText, jobId);
   
@@ -1006,47 +1006,137 @@ async function analyzeResume(resumeText, jobText) {
   // For each major job requirement, find relevant resume sections
   const relevantContexts = [];
   
-  // Extract key requirements from job description
-  const jobRequirementKeywords = [
-    'required', 'must have', 'qualifications', 'skills', 'experience', 
-    'years', 'degree', 'certification', 'proficient', 'expert'
-  ];
-  
-  const jobLines = jobText.split('\n').filter(l => l.trim().length > 20);
-  const keyJobRequirements = jobLines
-    .filter(line => jobRequirementKeywords.some(kw => line.toLowerCase().includes(kw)))
-    .slice(0, 10); // Top 10 requirement lines
-  
-  // For each key requirement, retrieve relevant resume sections using RAG
-  for (const requirement of keyJobRequirements) {
-    const relevantResumeSections = await retrieveRelevantResumeSections(requirement, 3);
-    if (relevantResumeSections.length > 0) {
-      relevantContexts.push({
-        jobRequirement: requirement,
-        relevantResumeSections: relevantResumeSections.join('\n')
-      });
+  /**
+   * Intelligently extract and prioritize job sections
+   * Returns structured sections with priority (no size limits)
+   */
+  const extractJobSections = (jobText) => {
+    const lines = jobText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    const sections = {
+      requirements: [],      // Required qualifications
+      qualifications: [],    // Education/degree requirements
+      skills: [],           // Technical skills
+      responsibilities: [], // Job duties
+      preferred: [],        // Nice-to-have
+      other: []             // Everything else
+    };
+    
+    let currentSection = 'other';
+    let currentSectionLines = [];
+    
+    lines.forEach((line, idx) => {
+      const lowerLine = line.toLowerCase();
+      
+      // Detect section headers
+      if (lowerLine.includes('required') || lowerLine.includes('must have') || 
+          lowerLine.includes('requirements') || lowerLine.includes('minimum')) {
+        if (currentSectionLines.length > 0) {
+          sections[currentSection].push(currentSectionLines.join('\n'));
+        }
+        currentSection = 'requirements';
+        currentSectionLines = [line];
+      } else if (lowerLine.includes('qualification') || lowerLine.includes('education') || 
+                 lowerLine.includes('degree') || lowerLine.includes('bachelor') || 
+                 lowerLine.includes('master')) {
+        if (currentSectionLines.length > 0) {
+          sections[currentSection].push(currentSectionLines.join('\n'));
+        }
+        currentSection = 'qualifications';
+        currentSectionLines = [line];
+      } else if (lowerLine.includes('skill') || lowerLine.includes('technology') || 
+                 lowerLine.includes('proficient') || lowerLine.includes('expert')) {
+        if (currentSectionLines.length > 0 && currentSection !== 'skills') {
+          sections[currentSection].push(currentSectionLines.join('\n'));
+        }
+        if (currentSection !== 'skills') {
+          currentSection = 'skills';
+          currentSectionLines = [line];
+        } else {
+          currentSectionLines.push(line);
+        }
+      } else if (lowerLine.includes('responsibilit') || lowerLine.includes('duties') || 
+                 lowerLine.includes('what you') || lowerLine.includes('you will')) {
+        if (currentSectionLines.length > 0) {
+          sections[currentSection].push(currentSectionLines.join('\n'));
+        }
+        currentSection = 'responsibilities';
+        currentSectionLines = [line];
+      } else if (lowerLine.includes('preferred') || lowerLine.includes('nice to have') || 
+                 lowerLine.includes('bonus') || lowerLine.includes('plus')) {
+        if (currentSectionLines.length > 0) {
+          sections[currentSection].push(currentSectionLines.join('\n'));
+        }
+        currentSection = 'preferred';
+        currentSectionLines = [line];
+      } else {
+        currentSectionLines.push(line);
+      }
+    });
+    
+    // Add remaining lines
+    if (currentSectionLines.length > 0) {
+      sections[currentSection].push(currentSectionLines.join('\n'));
     }
-  }
+    
+    return sections;
+  };
   
-  // Also retrieve relevant job requirements for key resume sections
-  const resumeSectionKeywords = ['experience', 'skill', 'summary', 'education', 'project'];
+  // Extract all job sections (no size limits)
+  const jobSections = extractJobSections(jobText);
+  
+  // Build prioritized job text: requirements first, then qualifications, skills, etc.
+  const prioritizedJobText = [
+    ...(jobSections.requirements.length > 0 ? [`=== REQUIRED QUALIFICATIONS ===\n${jobSections.requirements.join('\n\n')}`] : []),
+    ...(jobSections.qualifications.length > 0 ? [`=== EDUCATION/QUALIFICATIONS ===\n${jobSections.qualifications.join('\n\n')}`] : []),
+    ...(jobSections.skills.length > 0 ? [`=== SKILLS & TECHNOLOGIES ===\n${jobSections.skills.join('\n\n')}`] : []),
+    ...(jobSections.responsibilities.length > 0 ? [`=== RESPONSIBILITIES ===\n${jobSections.responsibilities.join('\n\n')}`] : []),
+    ...(jobSections.preferred.length > 0 ? [`=== PREFERRED (Nice to Have) ===\n${jobSections.preferred.join('\n\n')}`] : []),
+    ...(jobSections.other.length > 0 ? [`=== ADDITIONAL INFORMATION ===\n${jobSections.other.join('\n\n')}`] : [])
+  ].join('\n\n');
+  
+  // Use RAG to retrieve ALL relevant sections (no arbitrary limits)
+  // Retrieve based on resume content to get the most relevant job requirements
+  const resumeSectionKeywords = ['experience', 'skill', 'summary', 'education', 'project', 'work'];
   const keyResumeSections = resumeText.split('\n')
     .filter(l => l.trim().length > 20)
     .filter(line => resumeSectionKeywords.some(kw => line.toLowerCase().includes(kw)))
-    .slice(0, 10);
+    .slice(0, 15); // Get more resume sections for better matching
   
+  // For each resume section, find relevant job requirements via RAG
   for (const resumeSection of keyResumeSections) {
-    const relevantJobRequirements = await retrieveRelevantJobRequirements(resumeSection, 3);
+    const relevantJobRequirements = await retrieveRelevantJobRequirements(resumeSection, 5); // Get more results
     if (relevantJobRequirements.length > 0) {
       relevantContexts.push({
         resumeSection: resumeSection,
-        relevantJobRequirements: relevantJobRequirements.join('\n')
+        relevantJobRequirements: relevantJobRequirements.join('\n\n---\n\n')
       });
     }
   }
   
-  // Build context string from RAG results
-  const context = relevantContexts.length > 0
+  // Also retrieve job requirements and find matching resume sections
+  const jobRequirementKeywords = [
+    'required', 'must have', 'qualifications', 'skills', 'experience', 
+    'years', 'degree', 'certification', 'proficient', 'expert', 'minimum'
+  ];
+  
+  // Extract key requirement lines (no limit on count)
+  const jobLines = jobText.split('\n').filter(l => l.trim().length > 20);
+  const keyJobRequirements = jobLines
+    .filter(line => jobRequirementKeywords.some(kw => line.toLowerCase().includes(kw)));
+  
+  // For each key requirement, retrieve relevant resume sections using RAG
+  for (const requirement of keyJobRequirements.slice(0, 20)) { // Process top 20, but retrieve all relevant matches
+    const relevantResumeSections = await retrieveRelevantResumeSections(requirement, 5); // Get more results
+    if (relevantResumeSections.length > 0) {
+      relevantContexts.push({
+        jobRequirement: requirement,
+        relevantResumeSections: relevantResumeSections.join('\n\n---\n\n')
+      });
+    }
+  }
+  
+  // Build context string from RAG results (include ALL relevant sections, no truncation)
+  const ragContext = relevantContexts.length > 0
     ? relevantContexts.map(ctx => {
         if (ctx.jobRequirement) {
           return `Job Requirement: "${ctx.jobRequirement}"\nRelevant Resume Sections:\n${ctx.relevantResumeSections}`;
@@ -1056,21 +1146,8 @@ async function analyzeResume(resumeText, jobText) {
       }).join('\n\n---\n\n')
     : '';
   
-  // Also retrieve similar job descriptions for additional context
-  // Limit RAG context to prevent huge prompts
-  const limitedContext = context.length > MAX_RAG_CONTEXT 
-    ? context.substring(0, MAX_RAG_CONTEXT) + '\n[... RAG context truncated ...]'
-    : context;
-  
-  const similarJobs = await retrieveSimilarContent(jobText, 1); // Reduced from 2 to 1
-  const similarJobsContext = similarJobs.length > 0 
-    ? `\n\nSimilar Job Descriptions for Reference:\n${similarJobs[0].substring(0, 500)}${similarJobs[0].length > 500 ? '...' : ''}`
-    : '';
-  
-  // Limit total context to prevent huge prompts
-  const fullContext = (limitedContext + similarJobsContext).length > MAX_RAG_CONTEXT * 2
-    ? (limitedContext + similarJobsContext).substring(0, MAX_RAG_CONTEXT * 2) + '\n[... context truncated ...]'
-    : limitedContext + similarJobsContext;
+  // Note: We include ALL RAG results - they're already filtered for relevance
+  // The full job text is always available in the prioritized format above
   
   // Generate analysis prompt
   const systemPrompt = `You are a resume analysis expert. You MUST provide SPECIFIC, JOB-SPECIFIC suggestions based on the ACTUAL job description and ACTUAL resume content. NO generic advice. Return ONLY valid JSON. No explanations, no markdown, no code blocks, just raw JSON.
@@ -1110,30 +1187,18 @@ Return exactly this JSON structure:
 
 CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no code blocks, no explanation text.`;
 
-  // Extract key requirements from job description for better prompting
-  const extractJobRequirements = (jobText) => {
-    const requirements = [];
-    const lines = jobText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    
-    // Look for common requirement patterns
-    const requirementKeywords = ['required', 'must have', 'qualifications', 'requirements', 'skills', 'experience', 'years', 'degree', 'certification'];
-    
-    lines.forEach((line, idx) => {
-      const lowerLine = line.toLowerCase();
-      if (requirementKeywords.some(kw => lowerLine.includes(kw))) {
-        // Get context around requirement lines
-        const context = [];
-        for (let i = Math.max(0, idx - 1); i <= Math.min(lines.length - 1, idx + 3); i++) {
-          context.push(lines[i]);
-        }
-        requirements.push(context.join(' '));
-      }
-    });
-    
-    return requirements.length > 0 ? requirements.join('\n') : jobText.substring(0, 1000);
+  // Extract key requirements summary (for quick reference, but full text is in prioritizedJobText)
+  const extractKeyRequirementsSummary = (jobSections) => {
+    // Combine all requirement-related sections
+    const allRequirements = [
+      ...jobSections.requirements,
+      ...jobSections.qualifications,
+      ...jobSections.skills
+    ];
+    return allRequirements.join('\n\n');
   };
 
-  const keyRequirements = extractJobRequirements(jobText);
+  const keyRequirementsSummary = extractKeyRequirementsSummary(jobSections);
   const resumeSections = resumeText.split('\n').filter(l => l.trim().length > 0).slice(0, 20).join('\n');
 
   // Enhanced resume structure analysis with detailed work experience and project parsing
@@ -1311,32 +1376,31 @@ CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no c
 
   const resumeStructure = analyzeResumeStructure(resumeText);
   
-  // Truncate inputs to prevent timeout - keep essential info but limit length
-  const MAX_JOB_TEXT = 1500; // Limit job description to 1500 chars (reduced from 2000)
-  const MAX_RESUME_TEXT = 2000; // Limit resume to 2000 chars (reduced from 3000)
-  const MAX_KEY_REQUIREMENTS = 500; // Limit key requirements (reduced from 1000)
-  const MAX_EXPERIENCE_DESC = 150; // Limit each work experience description
-  const MAX_PROJECT_DESC = 150; // Limit each project description
+  // Dynamic sizing: Only limit resume text for display purposes (resumes are typically shorter)
+  // Job text is handled via intelligent section extraction above (no hard limits)
+  const MAX_RESUME_TEXT = 2000; // Resume display limit (resumes are typically 1-2 pages)
+  const MAX_EXPERIENCE_DESC = 150; // Limit each work experience description for display
+  const MAX_PROJECT_DESC = 150; // Limit each project description for display
   
-  const truncatedJobText = jobText.length > MAX_JOB_TEXT 
-    ? jobText.substring(0, MAX_JOB_TEXT) + '\n[... truncated ...]'
-    : jobText;
+  // Use prioritized job text (all sections, intelligently organized)
+  const fullJobTextForPrompt = prioritizedJobText || jobText; // Fallback to full text if extraction fails
+  
   const truncatedResumeText = resumeText.length > MAX_RESUME_TEXT
-    ? resumeText.substring(0, MAX_RESUME_TEXT) + '\n[... truncated ...]'
+    ? resumeText.substring(0, MAX_RESUME_TEXT) + '\n[... resume truncated for display, full text available via RAG ...]'
     : resumeText;
-  const truncatedKeyRequirements = keyRequirements.length > MAX_KEY_REQUIREMENTS
-    ? keyRequirements.substring(0, MAX_KEY_REQUIREMENTS) + '\n[... truncated ...]'
-    : keyRequirements;
 
   const userPrompt = `You are a strict resume–job alignment evaluator.
 
 Your task is to analyze a JOB_DESCRIPTION and a RESUME and produce precise, evidence-based feedback.
 
-=== JOB DESCRIPTION (may contain UI noise) ===
-${truncatedJobText}
+=== FULL JOB DESCRIPTION (Intelligently Organized) ===
+${fullJobTextForPrompt}
 
-=== KEY REQUIREMENTS EXTRACTED ===
-${truncatedKeyRequirements}
+NOTE: The complete job description has been organized by priority (Required Qualifications, Skills, Responsibilities, etc.).
+All sections are included - no truncation. The full original text is also available in the vector database for reference.
+
+=== KEY REQUIREMENTS SUMMARY ===
+${keyRequirementsSummary || 'See full job description above for all requirements'}
 
 === RESUME STRUCTURE ===
 Summary: ${resumeStructure.hasSummary ? 'EXISTS' : 'MISSING'}
@@ -1357,6 +1421,12 @@ ${resumeStructure.skillsSection ? `Current: "${resumeStructure.skillsSection.sub
 
 === RESUME TEXT ===
 ${truncatedResumeText}
+
+=== RAG-ENHANCED CONTEXT (Most Relevant Job-Resume Matches) ===
+${ragContext || 'No specific matches found via RAG. Analyze the full job description above.'}
+
+NOTE: The RAG context above shows the most relevant job requirements matched to your resume sections.
+The full job description is available above for comprehensive analysis.
 
 === NON-NEGOTIABLE RULES ===
 
@@ -1606,17 +1676,63 @@ Return exactly this JSON structure:
   "updated_draft": "<updated resume with ONLY the proposed edits applied, or null if just asking questions>"
 }`;
 
-    // Truncate inputs but keep more context for better AI responses
-    const maxDraftLength = 3000; // Increased for better AI understanding
-    const maxJobLength = 2000; // Increased for better AI understanding
-    const maxHistoryLength = 1000; // Increased for better context
+    // Dynamic sizing: Use intelligent extraction for job text, reasonable limits for draft/history
+    const maxDraftLength = 3000; // Draft limit (resumes are typically shorter)
+    const maxHistoryLength = 1000; // History limit for context
+    
+    // Intelligently extract job sections (same as analysis)
+    const extractJobSectionsForChat = (jobText) => {
+      const lines = jobText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+      const sections = { requirements: [], qualifications: [], skills: [], responsibilities: [], preferred: [], other: [] };
+      let currentSection = 'other';
+      let currentSectionLines = [];
+      
+      lines.forEach((line) => {
+        const lowerLine = line.toLowerCase();
+        if (lowerLine.includes('required') || lowerLine.includes('must have')) {
+          if (currentSectionLines.length > 0) sections[currentSection].push(currentSectionLines.join('\n'));
+          currentSection = 'requirements';
+          currentSectionLines = [line];
+        } else if (lowerLine.includes('qualification') || lowerLine.includes('education')) {
+          if (currentSectionLines.length > 0) sections[currentSection].push(currentSectionLines.join('\n'));
+          currentSection = 'qualifications';
+          currentSectionLines = [line];
+        } else if (lowerLine.includes('skill') || lowerLine.includes('technology')) {
+          if (currentSectionLines.length > 0 && currentSection !== 'skills') {
+            sections[currentSection].push(currentSectionLines.join('\n'));
+          }
+          if (currentSection !== 'skills') {
+            currentSection = 'skills';
+            currentSectionLines = [line];
+          } else {
+            currentSectionLines.push(line);
+          }
+        } else if (lowerLine.includes('responsibilit') || lowerLine.includes('duties')) {
+          if (currentSectionLines.length > 0) sections[currentSection].push(currentSectionLines.join('\n'));
+          currentSection = 'responsibilities';
+          currentSectionLines = [line];
+        } else {
+          currentSectionLines.push(line);
+        }
+      });
+      if (currentSectionLines.length > 0) sections[currentSection].push(currentSectionLines.join('\n'));
+      return sections;
+    };
+    
+    const jobSectionsForChat = extractJobSectionsForChat(jobText);
+    const prioritizedJobForChat = [
+      ...(jobSectionsForChat.requirements.length > 0 ? [`=== REQUIRED ===\n${jobSectionsForChat.requirements.join('\n\n')}`] : []),
+      ...(jobSectionsForChat.qualifications.length > 0 ? [`=== QUALIFICATIONS ===\n${jobSectionsForChat.qualifications.join('\n\n')}`] : []),
+      ...(jobSectionsForChat.skills.length > 0 ? [`=== SKILLS ===\n${jobSectionsForChat.skills.join('\n\n')}`] : []),
+      ...(jobSectionsForChat.responsibilities.length > 0 ? [`=== RESPONSIBILITIES ===\n${jobSectionsForChat.responsibilities.join('\n\n')}`] : []),
+      ...(jobSectionsForChat.preferred.length > 0 ? [`=== PREFERRED ===\n${jobSectionsForChat.preferred.join('\n\n')}`] : []),
+      ...(jobSectionsForChat.other.length > 0 ? [`=== OTHER ===\n${jobSectionsForChat.other.join('\n\n')}`] : [])
+    ].join('\n\n');
     
     const truncatedDraft = currentDraft.length > maxDraftLength 
       ? currentDraft.substring(0, maxDraftLength) + '[...]'
       : currentDraft;
-    const truncatedJob = jobText.length > maxJobLength
-      ? jobText.substring(0, maxJobLength) + '[...]'
-      : jobText;
+    const jobTextForChat = prioritizedJobForChat || jobText; // Use prioritized sections, fallback to full text
     const truncatedHistory = chatHistory.length > 10
       ? chatHistory.slice(-10).map(msg => `${msg.role}: ${msg.content.substring(0, 200)}`).join('\n')
       : chatHistory.map(msg => `${msg.role}: ${msg.content}`).join('\n');
@@ -1624,8 +1740,8 @@ Return exactly this JSON structure:
     const userPrompt = `=== CURRENT DRAFT RESUME ===
 ${truncatedDraft}
 
-=== JOB DESCRIPTION ===
-${truncatedJob}
+=== JOB DESCRIPTION (Intelligently Organized) ===
+${jobTextForChat}
 
 ${context.length > 0 ? `=== RELEVANT CONTEXT ===\n${context.slice(0, 5).join('\n\n---\n\n')}\n` : ''}
 
