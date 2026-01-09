@@ -136,6 +136,31 @@ async function saveState() {
  */
 async function loadState() {
   try {
+    // Check if state was recently cleared (within last 5 seconds)
+    // If so, don't load it - start fresh
+    if (isExtensionContextValid() && typeof chrome !== 'undefined' && chrome.storage) {
+      const result = await new Promise<any>((resolve) => {
+        chrome.storage.local.get(['resumeFitStateCleared'], (result) => {
+          resolve(result);
+        });
+      });
+      
+      if (result.resumeFitStateCleared) {
+        const clearedTime = result.resumeFitStateCleared;
+        const timeSinceCleared = Date.now() - clearedTime;
+        // If cleared within last 5 seconds, don't load state
+        if (timeSinceCleared < 5000) {
+          console.log('[Sidebar] State was recently cleared, starting fresh');
+          // Remove the flag
+          chrome.storage.local.remove(['resumeFitStateCleared'], () => {});
+          return; // Don't load state
+        } else {
+          // Remove old flag
+          chrome.storage.local.remove(['resumeFitStateCleared'], () => {});
+        }
+      }
+    }
+    
     const message: MessagePayload = {
       type: 'LOAD_STATE',
     };
@@ -1152,17 +1177,27 @@ async function clearState() {
     state.analysisResult = undefined;
     state.pendingEdits = undefined;
     
-    // Clear from chrome.storage.local
+    // Clear from chrome.storage.local - wait for it to complete
     const message: MessagePayload = {
       type: 'CLEAR_STATE',
     };
     
     window.parent.postMessage(message, '*');
     
-    // Also try direct chrome.storage if available
+    // Also try direct chrome.storage if available - wait for completion
     if (isExtensionContextValid() && typeof chrome !== 'undefined' && chrome.storage) {
-      chrome.storage.local.remove(['resumeFitState'], () => {
-        console.log('[Sidebar] State cleared from storage');
+      await new Promise<void>((resolve) => {
+        chrome.storage.local.remove(['resumeFitState'], () => {
+          console.log('[Sidebar] State cleared from storage');
+          resolve();
+        });
+      });
+      
+      // Set a flag to indicate state was cleared (so we don't reload it on next open)
+      await new Promise<void>((resolve) => {
+        chrome.storage.local.set({ resumeFitStateCleared: Date.now() }, () => {
+          resolve();
+        });
       });
     }
     
@@ -1175,11 +1210,11 @@ async function clearState() {
 /**
  * Close sidebar
  */
-function closeSidebar() {
+async function closeSidebar() {
   console.log('[Sidebar] closeSidebar called');
   
-  // Clear state when closing
-  clearState();
+  // Clear state when closing - wait for it to complete
+  await clearState();
   
   const message: MessagePayload = {
     type: 'CLOSE_SIDEBAR',
