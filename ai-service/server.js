@@ -6,6 +6,7 @@ import cors from 'cors';
 import { ChromaClient } from 'chromadb';
 import { pipeline } from '@xenova/transformers';
 import dotenv from 'dotenv';
+import OpenAI from 'openai';
 
 dotenv.config();
 
@@ -17,12 +18,38 @@ const USE_OLLAMA = process.env.USE_OLLAMA !== 'false'; // Set to 'false' to disa
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.1';
 
+// OpenAI Configuration
+const USE_OPENAI = process.env.USE_OPENAI === 'true'; // Set to 'true' to use OpenAI
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'; // Use gpt-4o-mini for cost efficiency, or gpt-4o for better quality
+
+// AI Provider Selection: OpenAI takes precedence if API key is set
+const USE_OPENAI_BY_DEFAULT = OPENAI_API_KEY && OPENAI_API_KEY.length > 0;
+const ACTIVE_AI_PROVIDER = USE_OPENAI || USE_OPENAI_BY_DEFAULT ? 'openai' : 'ollama';
+
 // Ollama health and retry configuration
 let ollamaHealthy = false;
 const OLLAMA_MAX_RETRIES = 5;
 const OLLAMA_RETRY_DELAY = 2000; // 2 seconds between retries
-const OLLAMA_ANALYSIS_TIMEOUT = 600000; // 10 minutes for analysis (very long, no practical timeout)
+const OLLAMA_ANALYSIS_TIMEOUT = 180000; // 3 minutes for analysis (reduced to prevent hanging)
 const OLLAMA_CHAT_TIMEOUT = 120000; // 2 minutes for chat
+
+// OpenAI timeout configuration (faster than Ollama)
+const OPENAI_ANALYSIS_TIMEOUT = 120000; // 2 minutes for analysis
+const OPENAI_CHAT_TIMEOUT = 60000; // 1 minute for chat
+
+// Initialize OpenAI client if API key is provided
+let openaiClient = null;
+if (OPENAI_API_KEY && OPENAI_API_KEY.length > 0) {
+  try {
+    openaiClient = new OpenAI({
+      apiKey: OPENAI_API_KEY,
+    });
+    console.log('✅ OpenAI client initialized');
+  } catch (error) {
+    console.error('❌ Failed to initialize OpenAI client:', error.message);
+  }
+}
 
 // Middleware
 app.use(cors());
@@ -75,13 +102,48 @@ async function generateEmbedding(text) {
 }
 
 let chromaAvailable = false;
+let chromaReconnectAttempts = 0;
+const MAX_CHROMA_RECONNECT_ATTEMPTS = 3;
 
 /**
- * Initialize or get ChromaDB collection
+ * Check ChromaDB health and reconnect if needed
+ */
+async function checkChromaHealth() {
+  try {
+    const heartbeatPromise = chromaClient.heartbeat();
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Connection timeout')), 5000)
+    );
+    
+    await Promise.race([heartbeatPromise, timeoutPromise]);
+    
+    if (!chromaAvailable) {
+      console.log('✅ ChromaDB reconnected!');
+      chromaAvailable = true;
+      chromaReconnectAttempts = 0;
+      // Ensure collection exists
+      await getOrCreateCollection();
+    }
+    return true;
+  } catch (error) {
+    if (chromaAvailable) {
+      console.warn(`⚠️  ChromaDB connection lost: ${error.message}`);
+      chromaAvailable = false;
+    }
+    return false;
+  }
+}
+
+/**
+ * Initialize or get ChromaDB collection with automatic reconnection
  */
 async function getOrCreateCollection() {
+  // If not available, try to reconnect
   if (!chromaAvailable) {
-    return null; // Return null if ChromaDB not available
+    const reconnected = await checkChromaHealth();
+    if (!reconnected) {
+      return null; // Still not available
+    }
   }
   
   try {
@@ -94,17 +156,53 @@ async function getOrCreateCollection() {
   } catch (error) {
     console.warn('ChromaDB error:', error.message);
     chromaAvailable = false;
+    
+    // Try to reconnect once
+    if (chromaReconnectAttempts < MAX_CHROMA_RECONNECT_ATTEMPTS) {
+      chromaReconnectAttempts++;
+      console.log(`🔄 Attempting to reconnect to ChromaDB (attempt ${chromaReconnectAttempts}/${MAX_CHROMA_RECONNECT_ATTEMPTS})...`);
+      const reconnected = await checkChromaHealth();
+      if (reconnected) {
+        // Retry getting collection
+        try {
+          return await chromaClient.getOrCreateCollection({
+            name: COLLECTION_NAME,
+            metadata: { description: 'ResumeFit knowledge base' }
+          });
+        } catch (retryError) {
+          console.warn('ChromaDB retry failed:', retryError.message);
+        }
+      }
+    }
+    
     return null; // Gracefully handle ChromaDB unavailability
   }
 }
 
 /**
- * Store resume/job data in vector database
+ * Store resume/job data in vector database with automatic reconnection
  */
 async function storeInVectorDB(text, metadata) {
   try {
     const collection = await getOrCreateCollection();
     if (!collection) {
+      // Try one more time to reconnect
+      const reconnected = await checkChromaHealth();
+      if (reconnected) {
+        const retryCollection = await getOrCreateCollection();
+        if (!retryCollection) {
+          return false;
+        }
+        // Continue with retryCollection
+        const embedding = await generateEmbedding(text);
+        await retryCollection.add({
+          ids: [`doc_${Date.now()}_${Math.random()}`],
+          embeddings: [embedding],
+          documents: [text],
+          metadatas: [metadata],
+        });
+        return true;
+      }
       return false; // ChromaDB not available
     }
     
@@ -119,31 +217,62 @@ async function storeInVectorDB(text, metadata) {
     
     return true;
   } catch (error) {
-    console.error('Error storing in vector DB:', error);
+    console.error('Error storing in vector DB:', error.message);
+    // Try to reconnect on error
+    chromaAvailable = false;
+    const reconnected = await checkChromaHealth();
+    if (reconnected) {
+      console.log('🔄 ChromaDB reconnected, but storage failed. Will retry on next operation.');
+    }
     return false;
   }
 }
 
 /**
- * Retrieve similar content from vector database
+ * Retrieve similar content from vector database with timeout and auto-reconnect
  */
-async function retrieveSimilarContent(queryText, topK = 5) {
+async function retrieveSimilarContent(queryText, topK = 5, timeoutMs = 5000) {
   try {
-    const collection = await getOrCreateCollection();
+    let collection = await getOrCreateCollection();
     if (!collection) {
+      // Try to reconnect once
+      const reconnected = await checkChromaHealth();
+      if (reconnected) {
+        collection = await getOrCreateCollection();
+        if (!collection) {
+          return []; // Still not available
+        }
+      } else {
       return []; // ChromaDB not available, return empty
+      }
     }
     
-    const queryEmbedding = await generateEmbedding(queryText);
+    // Add timeout to embedding generation
+    const embeddingPromise = generateEmbedding(queryText);
+    const embeddingTimeout = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Embedding generation timeout')), timeoutMs)
+    );
     
-    const results = await collection.query({
+    const queryEmbedding = await Promise.race([embeddingPromise, embeddingTimeout]);
+    
+    // Add timeout to query
+    const queryPromise = collection.query({
       queryEmbeddings: [queryEmbedding],
       nResults: topK,
     });
+    const queryTimeout = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Query timeout')), timeoutMs)
+    );
+    
+    const results = await Promise.race([queryPromise, queryTimeout]);
     
     return results.documents[0] || [];
   } catch (error) {
+    if (error.message.includes('timeout')) {
+      console.warn(`RAG retrieval timeout for query (${queryText.substring(0, 50)}...):`, error.message);
+    } else {
     console.error('Error retrieving from vector DB:', error);
+    }
     return [];
   }
 }
@@ -329,13 +458,17 @@ async function storeJobChunks(jobText, jobId) {
 /**
  * Retrieve relevant resume sections for a job requirement using RAG
  */
-async function retrieveRelevantResumeSections(jobRequirement, topK = 5) {
+async function retrieveRelevantResumeSections(jobRequirement, topK = 5, timeoutMs = 3000) {
   try {
     const queryText = `resume section matching job requirement: ${jobRequirement}`;
-    const results = await retrieveSimilarContent(queryText, topK);
+    const results = await retrieveSimilarContent(queryText, topK, timeoutMs);
     return results || [];
   } catch (error) {
+    if (error.message.includes('timeout')) {
+      console.warn(`RAG timeout for resume sections (requirement: ${jobRequirement.substring(0, 50)}...)`);
+    } else {
     console.error('Error retrieving relevant resume sections:', error);
+    }
     return [];
   }
 }
@@ -343,13 +476,17 @@ async function retrieveRelevantResumeSections(jobRequirement, topK = 5) {
 /**
  * Retrieve relevant job requirements for a resume section using RAG
  */
-async function retrieveRelevantJobRequirements(resumeSection, topK = 5) {
+async function retrieveRelevantJobRequirements(resumeSection, topK = 5, timeoutMs = 3000) {
   try {
     const queryText = `job requirement matching resume: ${resumeSection}`;
-    const results = await retrieveSimilarContent(queryText, topK);
+    const results = await retrieveSimilarContent(queryText, topK, timeoutMs);
     return results || [];
   } catch (error) {
+    if (error.message.includes('timeout')) {
+      console.warn(`RAG timeout for job requirements (section: ${resumeSection.substring(0, 50)}...)`);
+    } else {
     console.error('Error retrieving relevant job requirements:', error);
+    }
     return [];
   }
 }
@@ -363,33 +500,59 @@ async function generateAIResponseForChat(prompt, context = '') {
     ? `${prompt}\n\nRelevant Context:\n${context}`
     : prompt;
   
-  // Primary: Ollama (with retries and reasonable timeout for chat)
+  // Primary: OpenAI (if API key is set)
+  if (ACTIVE_AI_PROVIDER === 'openai' && openaiClient) {
+    try {
+      console.log(`   🤖 Using OpenAI (${OPENAI_MODEL}) for chat...`);
+      const messages = [
+        {
+          role: 'system',
+          content: 'You are a helpful resume editing assistant. Always respond with valid JSON when requested.'
+        },
+        {
+          role: 'user',
+          content: enhancedPrompt
+        }
+      ];
+      return await callOpenAI(messages, OPENAI_CHAT_TIMEOUT);
+    } catch (error) {
+      console.error('❌ OpenAI failed for chat:', error.message);
+      // Fall back to Ollama if available
+  if (USE_OLLAMA) {
+        console.log('   🔄 Falling back to Ollama for chat...');
+        try {
+          return await callOllamaWithRetry(enhancedPrompt, OLLAMA_CHAT_TIMEOUT);
+        } catch (ollamaError) {
+          console.warn('   Ollama also failed, using fallback...');
+        }
+      }
+    }
+  }
+  
+  // Fallback: Ollama (if OpenAI is not configured)
   if (USE_OLLAMA) {
     try {
+      console.log(`   🤖 Using Ollama (${OLLAMA_MODEL}) for chat...`);
       return await callOllamaWithRetry(enhancedPrompt, OLLAMA_CHAT_TIMEOUT);
     } catch (error) {
       console.error('❌ Ollama failed for chat after all retries:', error.message);
-      // For chat, we can be slightly more lenient but still prefer Ollama
       console.warn('   Attempting fallback for chat...');
     }
   }
   
-  // Fallback: Only if Ollama is explicitly disabled or failed after retries
-  // Option 2: Use local transformers model (always try for chat)
+  // Fallback: Local transformers model
   try {
     return await generateWithLocalLLM(enhancedPrompt);
   } catch (error) {
     console.warn('Local LLM not available, trying fallback:', error.message);
   }
   
-  // Option 3: Chat-specific fallback (only if all AI options fail)
-  // Extract message from prompt for fallback
+  // Last resort: Chat-specific fallback
   const messageMatch = prompt.match(/User's current message:\s*(.+)/);
   const userMessage = messageMatch ? messageMatch[1] : 'user request';
   const draftMatch = prompt.match(/Current Draft Resume:\s*([\s\S]*?)(?=Job Description:)/);
   const currentDraft = draftMatch ? draftMatch[1].trim() : '';
   
-  // Return as JSON string (will be parsed in handleChatMessage)
   const fallbackResponse = generateChatFallbackResponse(userMessage, currentDraft);
   return JSON.stringify(fallbackResponse);
 }
@@ -412,13 +575,18 @@ async function callOllamaWithRetry(prompt, timeoutMs, retries = OLLAMA_MAX_RETRI
       
       console.log(`🔄 Ollama attempt ${attempt}/${retries}...`);
       const controller = new AbortController();
+      
+      // Set timeout to abort the request
       const timeoutId = setTimeout(() => {
-        console.warn(`⏱️  Ollama request timeout approaching (${Math.round(timeoutMs / 1000)}s)...`);
+        console.warn(`⏱️  Ollama request timeout approaching (${Math.round(timeoutMs / 1000)}s), aborting...`);
         controller.abort();
       }, timeoutMs);
       
       try {
         const fetchStartTime = Date.now();
+        
+        // No separate connection timeout - let the main timeout handle everything
+        // Ollama may need time to load the model or process large prompts
         const response = await fetch(`${OLLAMA_URL}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -426,24 +594,37 @@ async function callOllamaWithRetry(prompt, timeoutMs, retries = OLLAMA_MAX_RETRI
             model: OLLAMA_MODEL,
             messages: [{ role: 'user', content: prompt }],
             stream: false,
+            options: {
+              num_predict: 4000, // Limit response length to prevent very long generations
+              temperature: 0.3, // Lower temperature for more focused responses
+            }
           }),
           signal: controller.signal,
         });
         
         const fetchDuration = Math.round((Date.now() - fetchStartTime) / 1000);
-        console.log(`📥 Ollama response received (${fetchDuration}s)`);
+        console.log(`      📥 Response received from Ollama (${fetchDuration}s)`);
         
         clearTimeout(timeoutId);
         
+        // Check if response was aborted
+        if (controller.signal.aborted) {
+          throw new Error('Request was aborted due to timeout');
+        }
+        
         if (response.ok) {
           const parseStartTime = Date.now();
+          console.log(`      📄 Parsing response JSON...`);
           const data = await response.json();
           const parseDuration = Math.round((Date.now() - parseStartTime) / 1000);
           
           const content = data.message?.content || data.response || '';
           if (content && content.trim().length > 0) {
             const totalDuration = Math.round((Date.now() - attemptStartTime) / 1000);
-            console.log(`✅ Ollama success (${totalDuration}s total, response: ${content.length} chars)`);
+            console.log(`      ✅ Ollama success!`);
+            console.log(`         - Total time: ${totalDuration}s`);
+            console.log(`         - Response length: ${content.length} characters`);
+            console.log(`         - Parse time: ${parseDuration}s`);
             ollamaHealthy = true; // Mark as healthy on success
             return content;
           } else {
@@ -458,8 +639,10 @@ async function callOllamaWithRetry(prompt, timeoutMs, retries = OLLAMA_MAX_RETRI
         if (fetchError.name === 'AbortError') {
           const timeoutSeconds = Math.round(timeoutMs / 1000);
           const actualDuration = Math.round((Date.now() - attemptStartTime) / 1000);
+          console.error(`      ❌ Request timed out after ${actualDuration}s (limit: ${timeoutSeconds}s)`);
           throw new Error(`Request timed out after ${actualDuration} seconds (limit: ${timeoutSeconds}s)`);
         }
+        console.error(`      ❌ Fetch error: ${fetchError.message}`);
         throw fetchError;
       }
     } catch (error) {
@@ -469,54 +652,132 @@ async function callOllamaWithRetry(prompt, timeoutMs, retries = OLLAMA_MAX_RETRI
       
       if (isLastAttempt) {
         ollamaHealthy = false;
-        console.error(`❌ Ollama failed after ${retries} attempts (last attempt: ${attemptDuration}s)`);
+        console.error(`      ❌ Ollama failed after ${retries} attempts`);
+        console.error(`         - Last attempt duration: ${attemptDuration}s`);
+        console.error(`         - Error: ${error.message}`);
         throw new Error(`Ollama failed after ${retries} attempts: ${error.message}`);
       }
       
-      console.warn(`⚠️  Ollama attempt ${attempt}/${retries} failed after ${attemptDuration}s: ${error.message}`);
-      console.log(`   Retrying in ${delay / 1000} seconds...`);
+      console.warn(`      ⚠️  Attempt ${attempt}/${retries} failed (${attemptDuration}s): ${error.message}`);
+      console.log(`      ⏳ Retrying in ${Math.round(delay / 1000)} seconds...`);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 }
 
 /**
- * Generate AI response using local LLM with RAG
- * 
- * Primary: Ollama (with retries and long timeouts)
- * Fallback: Only if Ollama is truly unavailable after all retries
+ * Call OpenAI API
  */
-async function generateAIResponse(prompt, context = '', timeoutMs = OLLAMA_ANALYSIS_TIMEOUT) {
+async function callOpenAI(messages, timeoutMs = OPENAI_ANALYSIS_TIMEOUT) {
+  if (!openaiClient) {
+    throw new Error('OpenAI client not initialized. Please set OPENAI_API_KEY environment variable.');
+  }
+  
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, timeoutMs);
+    
+    try {
+      const response = await openaiClient.chat.completions.create({
+        model: OPENAI_MODEL,
+        messages: messages,
+        temperature: 0.3, // Lower temperature for more focused responses
+        max_tokens: 4000, // Limit response length
+        response_format: { type: "json_object" }, // Request JSON response
+      }, {
+        signal: controller.signal,
+      });
+      
+      clearTimeout(timeoutId);
+      
+      const content = response.choices[0]?.message?.content || '';
+      if (!content) {
+        throw new Error('Empty response from OpenAI');
+      }
+      
+      return content;
+    } catch (fetchError) {
+      clearTimeout(timeoutId);
+      if (fetchError.name === 'AbortError') {
+        throw new Error(`OpenAI request timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+      }
+      throw fetchError;
+    }
+  } catch (error) {
+    if (error instanceof OpenAI.APIError) {
+      throw new Error(`OpenAI API error: ${error.message} (status: ${error.status})`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Generate AI response using OpenAI or Ollama with RAG
+ * 
+ * Primary: OpenAI (if API key is set) or Ollama
+ * Fallback: Only if both are unavailable
+ */
+async function generateAIResponse(prompt, context = '', timeoutMs = null) {
   // Enhanced prompt with retrieved context
   const enhancedPrompt = context 
     ? `${prompt}\n\nRelevant Context:\n${context}`
     : prompt;
   
-  // Primary: Ollama (this is what the project is built around)
+  // Determine timeout based on provider
+  const analysisTimeout = timeoutMs || (ACTIVE_AI_PROVIDER === 'openai' ? OPENAI_ANALYSIS_TIMEOUT : OLLAMA_ANALYSIS_TIMEOUT);
+  
+  // Primary: OpenAI (if API key is set)
+  if (ACTIVE_AI_PROVIDER === 'openai' && openaiClient) {
+    try {
+      console.log(`   🤖 Using OpenAI (${OPENAI_MODEL})...`);
+      const messages = [
+        {
+          role: 'system',
+          content: 'You are a helpful AI assistant. Always respond with valid JSON when requested.'
+        },
+        {
+          role: 'user',
+          content: enhancedPrompt
+        }
+      ];
+      return await callOpenAI(messages, analysisTimeout);
+    } catch (error) {
+      console.error('❌ OpenAI failed:', error.message);
+      // Fall back to Ollama if available
+  if (USE_OLLAMA) {
+        console.log('   🔄 Falling back to Ollama...');
+        try {
+          return await callOllamaWithRetry(enhancedPrompt, analysisTimeout);
+        } catch (ollamaError) {
+          throw new Error(`Both OpenAI and Ollama failed. OpenAI: ${error.message}, Ollama: ${ollamaError.message}`);
+        }
+      }
+      throw new Error(`OpenAI failed: ${error.message}`);
+    }
+  }
+  
+  // Fallback: Ollama (if OpenAI is not configured)
   if (USE_OLLAMA) {
     try {
-      return await callOllamaWithRetry(enhancedPrompt, timeoutMs);
+      console.log(`   🤖 Using Ollama (${OLLAMA_MODEL})...`);
+      return await callOllamaWithRetry(enhancedPrompt, analysisTimeout);
     } catch (error) {
       console.error('❌ Ollama failed after all retries:', error.message);
-      console.error('   This service is built around Ollama - please ensure it is running');
-      console.error('   Start Ollama: ollama serve');
-      // Don't fall back immediately - throw error to make it clear Ollama is required
       throw new Error(`Ollama is required but unavailable: ${error.message}`);
     }
   }
   
-  // Fallback: Only if Ollama is explicitly disabled
-  console.warn('⚠️  Ollama is disabled, using fallback (not recommended)');
-  
-  // Option 2: Use local transformers model (fully local, no Ollama needed)
-  // This is slower but works without any external services
+  // Final fallback: Local transformers model
+  console.warn('⚠️  No AI provider available, using local fallback (not recommended)');
   try {
     return await generateWithLocalLLM(enhancedPrompt);
   } catch (error) {
-    console.warn('Local LLM not available, using fallback:', error.message);
+    console.warn('Local LLM not available, using rule-based fallback:', error.message);
   }
   
-  // Option 3: Fallback to rule-based response
+  // Last resort: Rule-based response
   return await generateFallbackResponse(prompt);
 }
 
@@ -990,6 +1251,15 @@ async function generateFallbackResponse(prompt) {
  * Analyze resume with RAG
  */
 async function analyzeResume(resumeText, jobText) {
+  const analysisStartTime = Date.now();
+  console.log(`\n${'='.repeat(80)}`);
+  console.log(`📊 STARTING RESUME ANALYSIS`);
+  console.log(`${'='.repeat(80)}`);
+  console.log(`📝 Resume length: ${resumeText.length} characters`);
+  console.log(`📋 Job description length: ${jobText.length} characters`);
+  console.log(`⏰ Start time: ${new Date().toISOString()}`);
+  console.log(`${'='.repeat(80)}\n`);
+  
   // Dynamic approach: No hardcoded limits - use intelligent extraction and RAG
   // The full job text is always stored in RAG, and we intelligently extract what's needed for the prompt
   
@@ -997,10 +1267,33 @@ async function analyzeResume(resumeText, jobText) {
   const sessionId = `session_${Date.now()}`;
   const resumeId = `${sessionId}_resume`;
   const jobId = `${sessionId}_job`;
+  console.log(`🆔 Session ID: ${sessionId}\n`);
   
-  // Store resume and job chunks in vector DB for RAG (full text, no limits)
-  const resumeChunks = await storeResumeChunks(resumeText, resumeId);
-  const jobChunks = await storeJobChunks(jobText, jobId);
+  // Store resume and job chunks in vector DB for RAG (with timeout to prevent blocking)
+  console.log(`${'-'.repeat(80)}`);
+  console.log(`💾 STEP 1: Storing chunks in vector DB...`);
+  console.log(`${'-'.repeat(80)}`);
+  const storeStartTime = Date.now();
+  
+  // Run storage operations in parallel with timeout
+  const storagePromise = Promise.all([
+    storeResumeChunks(resumeText, resumeId),
+    storeJobChunks(jobText, jobId)
+  ]);
+  
+  const storageTimeout = new Promise((resolve) => {
+    setTimeout(() => {
+      console.warn('⚠️  Vector DB storage taking too long, continuing without it...');
+      resolve([[], []]);
+    }, 10000); // 10 second timeout for storage
+  });
+  
+  const [resumeChunks, jobChunks] = await Promise.race([storagePromise, storageTimeout]);
+  const storeDuration = Math.round((Date.now() - storeStartTime) / 1000);
+  console.log(`✅ Chunks stored in ${storeDuration}s`);
+  console.log(`   - Resume chunks: ${resumeChunks.length}`);
+  console.log(`   - Job chunks: ${jobChunks.length}`);
+  console.log(`${'-'.repeat(80)}\n`);
   
   // Use RAG to retrieve relevant sections
   // For each major job requirement, find relevant resume sections
@@ -1094,46 +1387,90 @@ async function analyzeResume(resumeText, jobText) {
     ...(jobSections.other.length > 0 ? [`=== ADDITIONAL INFORMATION ===\n${jobSections.other.join('\n\n')}`] : [])
   ].join('\n\n');
   
-  // Use RAG to retrieve ALL relevant sections (no arbitrary limits)
-  // Retrieve based on resume content to get the most relevant job requirements
+  // Use RAG to retrieve relevant sections with optimizations:
+  // 1. Reduce number of calls (process fewer, more important sections)
+  // 2. Add timeouts to prevent hanging
+  // 3. Use parallel processing where possible
+  
+  console.log(`${'-'.repeat(80)}`);
+  console.log(`🔍 STEP 2: Starting RAG retrieval...`);
+  console.log(`${'-'.repeat(80)}`);
+  const ragStartTime = Date.now();
+  
+  // Retrieve based on resume content - prioritize most important sections
   const resumeSectionKeywords = ['experience', 'skill', 'summary', 'education', 'project', 'work'];
   const keyResumeSections = resumeText.split('\n')
     .filter(l => l.trim().length > 20)
     .filter(line => resumeSectionKeywords.some(kw => line.toLowerCase().includes(kw)))
-    .slice(0, 15); // Get more resume sections for better matching
+    .slice(0, 8); // Reduced from 15 to 8 for faster processing
   
-  // For each resume section, find relevant job requirements via RAG
-  for (const resumeSection of keyResumeSections) {
-    const relevantJobRequirements = await retrieveRelevantJobRequirements(resumeSection, 5); // Get more results
+  // Process resume sections in parallel with timeout
+  const resumeSectionPromises = keyResumeSections.map(async (resumeSection) => {
+    try {
+      const relevantJobRequirements = await Promise.race([
+        retrieveRelevantJobRequirements(resumeSection, 3), // Reduced from 5 to 3
+        new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 3000))
+      ]);
     if (relevantJobRequirements.length > 0) {
-      relevantContexts.push({
+        return {
         resumeSection: resumeSection,
-        relevantJobRequirements: relevantJobRequirements.join('\n\n---\n\n')
-      });
+          relevantJobRequirements: relevantJobRequirements.join('\n\n---\n\n')
+        };
+      }
+      return null;
+    } catch (error) {
+      console.warn(`RAG timeout for resume section: ${resumeSection.substring(0, 50)}...`);
+      return null;
     }
-  }
+  });
   
-  // Also retrieve job requirements and find matching resume sections
+  const resumeResults = await Promise.all(resumeSectionPromises);
+  resumeResults.forEach(result => {
+    if (result) relevantContexts.push(result);
+  });
+  
+  // Extract key requirement lines - prioritize most important
   const jobRequirementKeywords = [
     'required', 'must have', 'qualifications', 'skills', 'experience', 
     'years', 'degree', 'certification', 'proficient', 'expert', 'minimum'
   ];
   
-  // Extract key requirement lines (no limit on count)
   const jobLines = jobText.split('\n').filter(l => l.trim().length > 20);
   const keyJobRequirements = jobLines
-    .filter(line => jobRequirementKeywords.some(kw => line.toLowerCase().includes(kw)));
+    .filter(line => jobRequirementKeywords.some(kw => line.toLowerCase().includes(kw)))
+    .slice(0, 10); // Reduced from 20 to 10 for faster processing
   
-  // For each key requirement, retrieve relevant resume sections using RAG
-  for (const requirement of keyJobRequirements.slice(0, 20)) { // Process top 20, but retrieve all relevant matches
-    const relevantResumeSections = await retrieveRelevantResumeSections(requirement, 5); // Get more results
-    if (relevantResumeSections.length > 0) {
-      relevantContexts.push({
-        jobRequirement: requirement,
-        relevantResumeSections: relevantResumeSections.join('\n\n---\n\n')
-      });
+  // Process job requirements in parallel with timeout
+  const jobRequirementPromises = keyJobRequirements.map(async (requirement) => {
+    try {
+      const relevantResumeSections = await Promise.race([
+        retrieveRelevantResumeSections(requirement, 3), // Reduced from 5 to 3
+        new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 3000))
+      ]);
+      if (relevantResumeSections.length > 0) {
+        return {
+          jobRequirement: requirement,
+          relevantResumeSections: relevantResumeSections.join('\n\n---\n\n')
+        };
+      }
+      return null;
+    } catch (error) {
+      console.warn(`RAG timeout for job requirement: ${requirement.substring(0, 50)}...`);
+      return null;
     }
-  }
+  });
+  
+  const jobResults = await Promise.all(jobRequirementPromises);
+  jobResults.forEach(result => {
+    if (result) relevantContexts.push(result);
+  });
+  
+  const ragDuration = Math.round((Date.now() - ragStartTime) / 1000);
+  console.log(`✅ RAG retrieval completed in ${ragDuration}s`);
+  console.log(`   - Total matches found: ${relevantContexts.length}`);
+  console.log(`   - Resume sections processed: ${keyResumeSections.length}`);
+  console.log(`   - Job requirements processed: ${keyJobRequirements.length}`);
+  console.log(`${'-'.repeat(80)}\n`);
   
   // Build context string from RAG results (include ALL relevant sections, no truncation)
   const ragContext = relevantContexts.length > 0
@@ -1393,11 +1730,12 @@ CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no c
 
 Your task is to analyze a JOB_DESCRIPTION and a RESUME and produce precise, evidence-based feedback.
 
-=== FULL JOB DESCRIPTION (Intelligently Organized) ===
-${fullJobTextForPrompt}
+=== JOB DESCRIPTION (Key Sections) ===
+${fullJobTextForPrompt.length > 8000 
+  ? fullJobTextForPrompt.substring(0, 8000) + '\n[... job description truncated for performance - full text available in RAG context ...]'
+  : fullJobTextForPrompt}
 
-NOTE: The complete job description has been organized by priority (Required Qualifications, Skills, Responsibilities, etc.).
-All sections are included - no truncation. The full original text is also available in the vector database for reference.
+NOTE: The job description has been organized by priority. If truncated, the full text is available in the RAG context below.
 
 === KEY REQUIREMENTS SUMMARY ===
 ${keyRequirementsSummary || 'See full job description above for all requirements'}
@@ -1546,8 +1884,31 @@ CRITICAL:
 - Maximum 10 suggestions
 - Skills section: max 18 total skills, grouped by category`;
 
-  // Use very long timeout for analysis (10 minutes) - Ollama should never timeout
-  const response = await generateAIResponse(userPrompt, fullContext, OLLAMA_ANALYSIS_TIMEOUT);
+  // Use timeout for analysis
+  const analysisTimeout = ACTIVE_AI_PROVIDER === 'openai' ? OPENAI_ANALYSIS_TIMEOUT : OLLAMA_ANALYSIS_TIMEOUT;
+  const modelName = ACTIVE_AI_PROVIDER === 'openai' ? OPENAI_MODEL : OLLAMA_MODEL;
+  
+  console.log(`${'-'.repeat(80)}`);
+  console.log(`🤖 STEP 3: Calling AI (${ACTIVE_AI_PROVIDER.toUpperCase()}) for analysis...`);
+  console.log(`${'-'.repeat(80)}`);
+  console.log(`   - User prompt length: ${userPrompt.length} characters`);
+  console.log(`   - RAG context length: ${ragContext.length} characters`);
+  console.log(`   - Total prompt size: ${userPrompt.length + ragContext.length} characters`);
+  console.log(`   - Timeout: ${Math.round(analysisTimeout / 1000)} seconds`);
+  console.log(`   - Model: ${modelName}`);
+  console.log(`   - Provider: ${ACTIVE_AI_PROVIDER === 'openai' ? 'OpenAI API' : 'Ollama (local)'}`);
+  console.log(`   ⏳ Waiting for AI response... (this may take 1-3 minutes)\n`);
+  
+  const aiStartTime = Date.now();
+  const response = await generateAIResponse(userPrompt, ragContext, analysisTimeout);
+  const aiDuration = Math.round((Date.now() - aiStartTime) / 1000);
+  console.log(`✅ AI response received in ${aiDuration}s`);
+  console.log(`   - Response length: ${response.length} characters`);
+  console.log(`${'-'.repeat(80)}\n`);
+  
+  console.log(`${'-'.repeat(80)}`);
+  console.log(`📝 STEP 4: Parsing and validating response...`);
+  console.log(`${'-'.repeat(80)}`);
   
   // Extract JSON from response
   let jsonText = response.trim();
@@ -1559,7 +1920,14 @@ CRITICAL:
   }
   
   try {
+    console.log(`   - Extracted JSON length: ${jsonText.length} characters`);
     const parsed = JSON.parse(jsonText);
+    console.log(`   - JSON parsed successfully`);
+    console.log(`   - Score: ${parsed.score}`);
+    console.log(`   - Matched keywords: ${parsed.matched_keywords?.length || 0}`);
+    console.log(`   - Missing keywords: ${parsed.missing_keywords?.length || 0}`);
+    console.log(`   - Suggested edits: ${parsed.suggested_edits?.length || 0}`);
+    console.log(`${'-'.repeat(80)}\n`);
     
     // Transform new format to expected format for backward compatibility
     // New format: { top_alignment_gaps, resume_edits, skills_section, ignored_noise }
@@ -1596,7 +1964,7 @@ CRITICAL:
       const editCount = suggested_edits.length;
       const score = Math.max(0, Math.min(100, 100 - (gapCount * 10) - (editCount * 5)));
       
-      return {
+      const result = {
         score: score,
         matched_keywords: matched_keywords,
         missing_keywords: [...new Set(missing_keywords)],
@@ -1607,8 +1975,38 @@ CRITICAL:
         skills_section: parsed.skills_section || {},
         ignored_noise: parsed.ignored_noise || []
       };
+      
+      // Log final summary
+      const totalDuration = Math.round((Date.now() - analysisStartTime) / 1000);
+      const parseDuration = Math.round((Date.now() - aiStartTime - aiDuration) / 1000);
+      console.log(`${'='.repeat(80)}`);
+      console.log(`✅ ANALYSIS COMPLETED SUCCESSFULLY`);
+      console.log(`${'='.repeat(80)}`);
+      console.log(`⏱️  Total time: ${totalDuration} seconds (${Math.round(totalDuration / 60)} minutes)`);
+      console.log(`   - Storage: ${Math.round((storeStartTime - analysisStartTime) / 1000)}s`);
+      console.log(`   - RAG retrieval: ${ragDuration}s`);
+      console.log(`   - AI processing: ${aiDuration}s`);
+      console.log(`   - Parsing: ${parseDuration}s`);
+      console.log(`⏰ End time: ${new Date().toISOString()}`);
+      console.log(`${'='.repeat(80)}\n`);
+      
+      return result;
     } else if (parsed.suggested_edits) {
       // Old format - return as is
+      // Log final summary
+      const totalDuration = Math.round((Date.now() - analysisStartTime) / 1000);
+      const parseDuration = Math.round((Date.now() - aiStartTime - aiDuration) / 1000);
+      console.log(`${'='.repeat(80)}`);
+      console.log(`✅ ANALYSIS COMPLETED SUCCESSFULLY`);
+      console.log(`${'='.repeat(80)}`);
+      console.log(`⏱️  Total time: ${totalDuration} seconds (${Math.round(totalDuration / 60)} minutes)`);
+      console.log(`   - Storage: ${Math.round((storeStartTime - analysisStartTime) / 1000)}s`);
+      console.log(`   - RAG retrieval: ${ragDuration}s`);
+      console.log(`   - AI processing: ${aiDuration}s`);
+      console.log(`   - Parsing: ${parseDuration}s`);
+      console.log(`⏰ End time: ${new Date().toISOString()}`);
+      console.log(`${'='.repeat(80)}\n`);
+      
       return parsed;
     } else {
       // Unknown format - try to construct from available data
@@ -1908,12 +2306,12 @@ app.post('/api/analyze', async (req, res) => {
       activeAnalysisRequest = null;
       activeAnalysisRequestStartTime = null;
     } else {
-      return res.status(429).json({
-        success: false,
+    return res.status(429).json({
+      success: false,
         error: `Analysis already in progress. Please wait for the current analysis to complete. (Running for ${duration || 'unknown'} seconds)`,
         requestId: activeAnalysisRequest,
         durationSeconds: duration,
-      });
+    });
     }
   }
   
@@ -2138,9 +2536,11 @@ async function startServer() {
       }
     }
     
-    // Test vector DB connection with timeout
+    // Test vector DB connection with timeout and retry
+    console.log('🔍 Checking ChromaDB connection...');
+    let chromaConnected = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      // Test ChromaDB connection with 5 second timeout
       const heartbeatPromise = chromaClient.heartbeat();
       const timeoutPromise = new Promise((_, reject) => 
         setTimeout(() => reject(new Error('Connection timeout')), 5000)
@@ -2148,21 +2548,47 @@ async function startServer() {
       
       await Promise.race([heartbeatPromise, timeoutPromise]);
       chromaAvailable = true;
+        chromaConnected = true;
       await getOrCreateCollection();
       console.log('✅ Vector database (ChromaDB) connected');
+        break;
     } catch (error) {
+        console.warn(`⚠️  ChromaDB connection attempt ${attempt}/3 failed: ${error.message}`);
+        if (attempt < 3) {
+          console.log(`   Retrying in 2 seconds...`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+    }
+    
+    if (!chromaConnected) {
       chromaAvailable = false;
-      console.warn('⚠️  Vector database (ChromaDB) not available:', error.message);
+      console.warn('⚠️  Vector database (ChromaDB) not available after 3 attempts');
       console.warn('   Service will continue but RAG features will be limited');
       console.warn('   To enable: docker run -d -p 8000:8000 chromadb/chroma');
+      console.warn('   The service will automatically reconnect when ChromaDB becomes available');
     }
+    
+    // Start periodic health check for ChromaDB (every 30 seconds)
+    setInterval(async () => {
+      if (!chromaAvailable) {
+        console.log('🔄 Checking ChromaDB availability...');
+        await checkChromaHealth();
+      }
+    }, 30000); // Check every 30 seconds
     
     // Display configuration
     console.log('\n📋 Configuration:');
+    console.log(`   AI Provider: ${ACTIVE_AI_PROVIDER === 'openai' ? '✅ OpenAI' : '✅ Ollama'}`);
+    if (ACTIVE_AI_PROVIDER === 'openai') {
+      console.log(`   OpenAI Model: ${OPENAI_MODEL}`);
+      console.log(`   OpenAI API Key: ${OPENAI_API_KEY ? '✅ Set' : '❌ Not set'}`);
+    } else {
     console.log(`   Ollama: ${USE_OLLAMA ? (ollamaHealthy ? '✅ Healthy' : '❌ Not available') : '❌ Disabled'}`);
     if (USE_OLLAMA) {
       console.log(`   Ollama URL: ${OLLAMA_URL}`);
       console.log(`   Ollama Model: ${OLLAMA_MODEL}`);
+      }
     }
     console.log(`   Vector DB: ${chromaAvailable ? '✅ Connected' : '❌ Not available'}`);
     console.log(`   Embeddings: ✅ Local (Xenova/all-MiniLM-L6-v2)\n`);

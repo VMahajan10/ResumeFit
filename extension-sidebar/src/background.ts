@@ -174,15 +174,63 @@ chrome.runtime.onMessage.addListener(
     // Handle run analysis request
     if (message.type === 'RUN_ANALYSIS') {
       const { resumeText, jobText } = message.payload || {};
+      const requestId = `analysis_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const tabId = sender.tab?.id;
+      
+      // Immediately acknowledge the request to prevent channel timeout
+      sendResponse({ success: true, requestId, status: 'started' });
+      
+      // Run analysis asynchronously and send result via separate message
       runAnalysis({ resumeText, jobText })
-        .then((result) => sendResponse(result))
-        .catch((error) =>
-          sendResponse({
+        .then((result) => {
+          // Store result in chrome.storage and notify via message
+          const storageKey = `analysis_result_${requestId}`;
+          chrome.storage.local.set({ [storageKey]: result }, () => {
+            // Send result back to content script via separate message
+            if (tabId) {
+              chrome.tabs.sendMessage(tabId, {
+                type: 'RUN_ANALYSIS_RESPONSE',
+                payload: result,
+                requestId,
+              }).catch((err) => {
+                console.error('Failed to send analysis response:', err);
+                // Fallback: content script can poll storage if message fails
+              });
+            }
+            // Clean up storage after 1 minute
+            setTimeout(() => {
+              chrome.storage.local.remove([storageKey], () => {});
+            }, 60000);
+          });
+        })
+        .catch((error) => {
+          const errorResponse = {
             success: false,
             error: error.message,
-          } as AnalysisResponse)
-        );
-      return true; // Keep channel open for async response
+          } as AnalysisResponse;
+          
+          // Store error in chrome.storage
+          const storageKey = `analysis_result_${requestId}`;
+          chrome.storage.local.set({ [storageKey]: errorResponse }, () => {
+            // Send error back to content script via separate message
+            if (tabId) {
+              chrome.tabs.sendMessage(tabId, {
+                type: 'RUN_ANALYSIS_RESPONSE',
+                payload: errorResponse,
+                requestId,
+              }).catch((err) => {
+                console.error('Failed to send analysis error:', err);
+                // Fallback: content script can poll storage if message fails
+              });
+            }
+            // Clean up storage after 1 minute
+            setTimeout(() => {
+              chrome.storage.local.remove([storageKey], () => {});
+            }, 60000);
+          });
+        });
+      
+      return false; // Already sent response
     }
 
     // Handle chat message request

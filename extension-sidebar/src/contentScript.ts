@@ -254,6 +254,21 @@ try {
       
       console.log('[ContentScript] Received message from background:', message.type);
       
+      // Handle separate analysis response messages (sent after channel closes)
+      if (message.type === 'RUN_ANALYSIS_RESPONSE') {
+        // Forward to sidebar
+        if (sidebarIframe?.contentWindow) {
+          sidebarIframe.contentWindow.postMessage(
+            {
+              type: 'RUN_ANALYSIS_RESPONSE',
+              payload: (message as any).payload,
+            },
+            '*'
+          );
+        }
+        return false; // No response needed
+      }
+      
       if (message.type === 'TOGGLE_SIDEBAR') {
         console.log('[ContentScript] Handling TOGGLE_SIDEBAR');
         toggleSidebar();
@@ -372,6 +387,51 @@ window.addEventListener('message', (event) => {
       message.type === 'CHAT_MESSAGE'
     ) {
       try {
+        // For RUN_ANALYSIS, handle differently to avoid channel timeout
+        if (message.type === 'RUN_ANALYSIS') {
+          chrome.runtime.sendMessage(message, (response) => {
+            // Check for errors
+            if (chrome.runtime.lastError) {
+              const errorMsg = chrome.runtime.lastError.message || 'Unknown error';
+              console.error('[ContentScript] Runtime error:', errorMsg);
+              // Send error back to sidebar
+              if (sidebarIframe?.contentWindow) {
+                sidebarIframe.contentWindow.postMessage(
+                  {
+                    type: `${message.type}_RESPONSE`,
+                    payload: {
+                      success: false,
+                      error: errorMsg.includes('Extension context invalidated')
+                        ? 'Extension context invalidated. Please refresh the page.'
+                        : errorMsg,
+                    },
+                  },
+                  '*'
+                );
+              }
+              return;
+            }
+            
+            // For RUN_ANALYSIS, the immediate response is just an acknowledgment
+            // The actual result will come via a separate message
+            if (response?.status === 'started') {
+              console.log('[ContentScript] Analysis started, waiting for result...');
+              // Don't send acknowledgment to sidebar - wait for actual result
+            } else {
+              // Fallback: send whatever response we got
+              if (sidebarIframe?.contentWindow) {
+                sidebarIframe.contentWindow.postMessage(
+                  {
+                    type: `${message.type}_RESPONSE`,
+                    payload: response,
+                  },
+                  '*'
+                );
+              }
+            }
+          });
+        } else {
+          // For other message types, use normal callback pattern
         chrome.runtime.sendMessage(message, (response) => {
           // Check for errors
           if (chrome.runtime.lastError) {
@@ -406,6 +466,7 @@ window.addEventListener('message', (event) => {
             );
           }
         });
+        }
       } catch (error) {
         console.error('[ContentScript] Error sending message:', error);
         // Send error back to sidebar

@@ -585,7 +585,7 @@ async function handleRunAnalysis() {
             } else {
               // Clear in-progress flag for other errors
               isAnalysisInProgress = false;
-              showStatus(errorMsg, 'error');
+            showStatus(errorMsg, 'error');
             }
           }
 
