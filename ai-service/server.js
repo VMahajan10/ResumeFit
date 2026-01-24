@@ -684,7 +684,7 @@ async function callOpenAI(messages, timeoutMs = OPENAI_ANALYSIS_TIMEOUT) {
         model: OPENAI_MODEL,
         messages: messages,
         temperature: 0.3, // Lower temperature for more focused responses
-        max_tokens: 4000, // Limit response length
+        max_tokens: 16000, // Increased to handle comprehensive analysis with full context
         response_format: { type: "json_object" }, // Request JSON response
       }, {
         signal: controller.signal,
@@ -1402,14 +1402,14 @@ async function analyzeResume(resumeText, jobText) {
   const keyResumeSections = resumeText.split('\n')
     .filter(l => l.trim().length > 20)
     .filter(line => resumeSectionKeywords.some(kw => line.toLowerCase().includes(kw)))
-    .slice(0, 8); // Reduced from 15 to 8 for faster processing
+    .slice(0, 30); // Increased to process more sections for comprehensive analysis
   
   // Process resume sections in parallel with timeout
   const resumeSectionPromises = keyResumeSections.map(async (resumeSection) => {
     try {
       const relevantJobRequirements = await Promise.race([
-        retrieveRelevantJobRequirements(resumeSection, 3), // Reduced from 5 to 3
-        new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 3000))
+        retrieveRelevantJobRequirements(resumeSection, 10), // Increased to get more comprehensive matches
+        new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 5000))
       ]);
     if (relevantJobRequirements.length > 0) {
         return {
@@ -1438,14 +1438,14 @@ async function analyzeResume(resumeText, jobText) {
   const jobLines = jobText.split('\n').filter(l => l.trim().length > 20);
   const keyJobRequirements = jobLines
     .filter(line => jobRequirementKeywords.some(kw => line.toLowerCase().includes(kw)))
-    .slice(0, 10); // Reduced from 20 to 10 for faster processing
+    .slice(0, 50); // Increased to process more requirements for comprehensive analysis
   
   // Process job requirements in parallel with timeout
   const jobRequirementPromises = keyJobRequirements.map(async (requirement) => {
     try {
       const relevantResumeSections = await Promise.race([
-        retrieveRelevantResumeSections(requirement, 3), // Reduced from 5 to 3
-        new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 3000))
+        retrieveRelevantResumeSections(requirement, 10), // Increased to get more comprehensive matches
+        new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 5000))
       ]);
       if (relevantResumeSections.length > 0) {
         return {
@@ -1713,32 +1713,38 @@ CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no c
 
   const resumeStructure = analyzeResumeStructure(resumeText);
   
-  // Dynamic sizing: Only limit resume text for display purposes (resumes are typically shorter)
-  // Job text is handled via intelligent section extraction above (no hard limits)
-  const MAX_RESUME_TEXT = 2000; // Resume display limit (resumes are typically 1-2 pages)
-  const MAX_EXPERIENCE_DESC = 150; // Limit each work experience description for display
-  const MAX_PROJECT_DESC = 150; // Limit each project description for display
+  // NO CHARACTER LIMITS - Process full job description and resume
+  // All text is available via RAG and full context
+  const MAX_EXPERIENCE_DESC = 500; // Increased for better context
+  const MAX_PROJECT_DESC = 500; // Increased for better context
   
   // Use prioritized job text (all sections, intelligently organized)
+  // NO TRUNCATION - Full job text is always included
   const fullJobTextForPrompt = prioritizedJobText || jobText; // Fallback to full text if extraction fails
   
-  const truncatedResumeText = resumeText.length > MAX_RESUME_TEXT
-    ? resumeText.substring(0, MAX_RESUME_TEXT) + '\n[... resume truncated for display, full text available via RAG ...]'
-    : resumeText;
+  // NO TRUNCATION - Full resume text is always included
+  const fullResumeText = resumeText;
 
-  const userPrompt = `You are a strict resume–job alignment evaluator.
+  const userPrompt = `You are a technical resume–job alignment evaluator specializing in extracting and matching technical requirements.
 
-Your task is to analyze a JOB_DESCRIPTION and a RESUME and produce precise, evidence-based feedback.
+Your task is to analyze a JOB_DESCRIPTION and a RESUME and produce precise, evidence-based feedback with a STRONG FOCUS ON TECHNICAL ASPECTS.
 
-=== JOB DESCRIPTION (Key Sections) ===
-${fullJobTextForPrompt.length > 8000 
-  ? fullJobTextForPrompt.substring(0, 8000) + '\n[... job description truncated for performance - full text available in RAG context ...]'
-  : fullJobTextForPrompt}
+TECHNICAL FOCUS PRIORITY:
+1. Extract ALL technical requirements (programming languages, frameworks, tools, platforms, methodologies)
+2. Identify technical gaps where the resume lacks specific technologies mentioned in the job
+3. Suggest technical improvements that incorporate exact technical terminology from the job description
+4. Prioritize technical skills, certifications, and tools that will make the resume stand out
+5. Use RAG context to find semantic matches even when technical terms are worded differently
 
-NOTE: The job description has been organized by priority. If truncated, the full text is available in the RAG context below.
+=== FULL JOB DESCRIPTION (Complete Text - No Limits) ===
+${fullJobTextForPrompt}
 
-=== KEY REQUIREMENTS SUMMARY ===
-${keyRequirementsSummary || 'See full job description above for all requirements'}
+NOTE: This is the COMPLETE job description with ALL technical requirements, qualifications, and details. Use RAG context below for semantic matching.
+
+=== KEY TECHNICAL REQUIREMENTS SUMMARY ===
+${keyRequirementsSummary || 'See full job description above for all technical requirements'}
+
+NOTE: Focus on extracting technical aspects: programming languages, frameworks, tools, platforms, databases, cloud services, methodologies, certifications, and specific technical skills.
 
 === RESUME STRUCTURE ===
 Summary: ${resumeStructure.hasSummary ? 'EXISTS' : 'MISSING'}
@@ -1757,14 +1763,15 @@ ${resumeStructure.detailedProjects && resumeStructure.detailedProjects.length > 
 Skills: ${resumeStructure.skillsSection ? 'EXISTS' : 'MISSING'}
 ${resumeStructure.skillsSection ? `Current: "${resumeStructure.skillsSection.substring(0, 150)}"` : ''}
 
-=== RESUME TEXT ===
-${truncatedResumeText}
+=== FULL RESUME TEXT (Complete Text - No Limits) ===
+${fullResumeText}
 
-=== RAG-ENHANCED CONTEXT (Most Relevant Job-Resume Matches) ===
+=== RAG-ENHANCED CONTEXT (Semantic Matches - Technical Focus) ===
 ${ragContext || 'No specific matches found via RAG. Analyze the full job description above.'}
 
-NOTE: The RAG context above shows the most relevant job requirements matched to your resume sections.
-The full job description is available above for comprehensive analysis.
+NOTE: The RAG context above shows semantic matches between job requirements and resume sections.
+This uses vector similarity to find ALL relevant technical aspects, even if wording differs.
+The full job description and resume are available above for comprehensive analysis.
 
 === NON-NEGOTIABLE RULES ===
 
@@ -1794,12 +1801,20 @@ STEP 1: Filter UI noise from job description
 - Identify and list all UI/boilerplate terms (e.g., "Apply now", "opens in a new window", "Less", "More", navigation elements)
 - These will be IGNORED in all analysis
 
-STEP 2: Extract REAL requirements from job description (quote exactly, ≤20 words each)
-- Only extract technologies, skills, qualifications, responsibilities that are:
-  - Explicitly stated in the job description
+STEP 2: Extract ALL technical requirements from job description (quote exactly, no word limit)
+- Extract ALL technologies, skills, qualifications, responsibilities, frameworks, tools, methodologies that are:
+  - Explicitly stated in the job description (even if mentioned once)
   - Real professional skills/technologies (not UI elements)
+  - Technical in nature (programming languages, frameworks, tools, platforms, certifications, methodologies)
   - Not in the ignored noise list
-- Create a numbered list with exact quotes (≤20 words each)
+- Pay special attention to:
+  - Programming languages and versions (e.g., "Python 3.8+", "Java 11", "TypeScript")
+  - Frameworks and libraries (e.g., "React", "Django", "Spring Boot", "TensorFlow")
+  - Cloud platforms and services (e.g., "AWS", "Azure", "GCP", "Kubernetes", "Docker")
+  - Databases and data technologies (e.g., "PostgreSQL", "MongoDB", "Redis", "Kafka")
+  - Tools and methodologies (e.g., "CI/CD", "Agile", "Scrum", "Git", "Jenkins")
+  - Certifications and qualifications (e.g., "AWS Certified", "PMP", "CISSP")
+- Create a comprehensive numbered list with exact quotes (no truncation)
 
 STEP 3: Map resume content to job requirements (quote exactly)
 For each requirement from Step 2, check:
@@ -1814,10 +1829,13 @@ For each requirement:
 - If found but vague/weak: This is a gap (only if you can quote evidence)
 - If found and well-stated: No gap
 
-STEP 5: Create suggestions (minimum 3, maximum 10, only if evidence supports)
+STEP 5: Create comprehensive suggestions (minimum 5, maximum 15, only if evidence supports)
+- Focus on TECHNICAL aspects that will make the resume stand out
+- Prioritize missing technical skills, tools, frameworks, and methodologies
+- Ensure suggestions incorporate exact technical terminology from the job description
 For EACH suggestion, you MUST provide:
 1. section: "experience" | "projects" | "skills" | "summary"
-2. job_requirement: Copy the EXACT text from the job description (≤20 words, from Step 2)
+2. job_requirement: Copy the EXACT text from the job description (no word limit - include full technical requirement)
 3. before: Copy the EXACT text from the resume that needs changing (or "null" if adding new)
 4. after: Write replacement text that:
    - Incorporates the EXACT keywords/phrases from the job requirement
@@ -1827,7 +1845,7 @@ For EACH suggestion, you MUST provide:
 5. reason: Explain HOW this specific change addresses the specific job requirement, with evidence quotes
 6. alignment_impact: Explain how this improves alignment with evidence
 7. priority: "high" if required qualification, "medium" if preferred, "low" if nice-to-have
-8. job_keywords_addressed: List the EXACT keywords/phrases from the job description (≤20 words total)
+8. job_keywords_addressed: List ALL relevant technical keywords/phrases from the job description (no limit - be comprehensive)
 
 QUALITY BAR:
 - If you cannot find at least 3 meaningful gaps supported by evidence, explain why instead of inventing feedback
@@ -1873,15 +1891,50 @@ This is REJECTED because:
 - before/after don't quote exact text
 - reason is generic
 
+=== OUTPUT FORMAT (REQUIRED JSON STRUCTURE) ===
+
+You MUST return a JSON object with this EXACT structure:
+
+{
+  "top_alignment_gaps": [
+    {
+      "job_requirement": "Exact quote from job description (full technical requirement, no word limit)",
+      "evidence_from_job": "Full quote showing where this requirement appears",
+      "evidence_from_resume": "Quote from resume or 'NOT FOUND IN RESUME'",
+      "gap_type": "missing" | "weak" | "vague",
+      "priority": "high" | "medium" | "low"
+    }
+  ],
+  "resume_edits": [
+    {
+      "section": "experience" | "projects" | "skills" | "summary",
+      "job_requirement": "Exact quote from job description (full technical requirement, no word limit)",
+      "before": "Exact text from resume to change (or null if adding new)",
+      "after": "Replacement text incorporating job requirement wording",
+      "reason": "Explanation with evidence quotes",
+      "alignment_impact": "How this improves alignment",
+      "priority": "high" | "medium" | "low",
+      "job_keywords_addressed": ["keyword1", "keyword2", ...]
+    }
+  ],
+  "skills_section": {
+    "current": "Current skills section text",
+    "suggested": "Suggested skills section with job keywords",
+    "added_keywords": ["keyword1", "keyword2", ...]
+  },
+  "ignored_noise": ["UI element 1", "UI element 2", ...]
+}
+
 CRITICAL: 
 - Return ONLY valid JSON matching the OUTPUT FORMAT above
 - No markdown, no code blocks, no explanations outside JSON
+- The "resume_edits" array is REQUIRED (minimum 5, maximum 15 - focus on technical improvements)
 - Follow all NON-NEGOTIABLE RULES strictly
 - Ignore UI noise (list in ignored_noise)
 - Only recommend skills/requirements explicitly in job description
 - Provide evidence quotes for every recommendation
 - Minimum 3 gaps if evidence supports, otherwise explain why
-- Maximum 10 suggestions
+- Maximum 15 suggestions (focus on technical aspects)
 - Skills section: max 18 total skills, grouped by category`;
 
   // Use timeout for analysis
@@ -2008,9 +2061,70 @@ CRITICAL:
       console.log(`${'='.repeat(80)}\n`);
       
       return parsed;
+    } else if (parsed.gaps && Array.isArray(parsed.gaps)) {
+      // Handle OpenAI returning "gaps" format - convert to resume_edits
+      console.log(`   ⚠️  Received "gaps" format, converting to "resume_edits"...`);
+      const resume_edits = parsed.gaps.map((gap, idx) => ({
+        section: gap.section || 'experience',
+        job_requirement: gap.job_requirement || gap.requirement || '',
+        before: gap.before || gap.current || null,
+        after: gap.after || gap.suggested || '',
+        reason: gap.reason || gap.explanation || '',
+        alignment_impact: gap.alignment_impact || gap.impact || '',
+        priority: gap.priority || 'medium',
+        job_keywords_addressed: gap.job_keywords_addressed || gap.keywords || []
+      }));
+      
+      const top_alignment_gaps = parsed.gaps.map(gap => ({
+        job_requirement: gap.job_requirement || gap.requirement || '',
+        evidence_from_job: gap.evidence_from_job || gap.job_requirement || '',
+        evidence_from_resume: gap.evidence_from_resume || gap.before || 'NOT FOUND IN RESUME',
+        gap_type: gap.gap_type || 'missing',
+        priority: gap.priority || 'medium'
+      }));
+      
+      const gapCount = top_alignment_gaps.length;
+      const editCount = resume_edits.length;
+      const score = Math.max(0, Math.min(100, 100 - (gapCount * 10) - (editCount * 5)));
+      
+      const missing_keywords = [];
+      top_alignment_gaps.forEach(gap => {
+        const evidence = gap.evidence_from_job || '';
+        const keywords = evidence.split(/\s+/).filter(w => w.length > 2 && !['the', 'and', 'or', 'with', 'for'].includes(w.toLowerCase()));
+        missing_keywords.push(...keywords.slice(0, 5));
+      });
+      
+      const result = {
+        score: score,
+        matched_keywords: [],
+        missing_keywords: [...new Set(missing_keywords)],
+        suggested_edits: resume_edits,
+        updated_draft: resumeText,
+        top_alignment_gaps: top_alignment_gaps,
+        skills_section: parsed.skills_section || {},
+        ignored_noise: parsed.ignored_noise || []
+      };
+      
+      // Log final summary
+      const totalDuration = Math.round((Date.now() - analysisStartTime) / 1000);
+      const parseDuration = Math.round((Date.now() - aiStartTime - aiDuration) / 1000);
+      console.log(`${'='.repeat(80)}`);
+      console.log(`✅ ANALYSIS COMPLETED SUCCESSFULLY`);
+      console.log(`${'='.repeat(80)}`);
+      console.log(`⏱️  Total time: ${totalDuration} seconds (${Math.round(totalDuration / 60)} minutes)`);
+      console.log(`   - Storage: ${Math.round((storeStartTime - analysisStartTime) / 1000)}s`);
+      console.log(`   - RAG retrieval: ${ragDuration}s`);
+      console.log(`   - AI processing: ${aiDuration}s`);
+      console.log(`   - Parsing: ${parseDuration}s`);
+      console.log(`⏰ End time: ${new Date().toISOString()}`);
+      console.log(`${'='.repeat(80)}\n`);
+      
+      return result;
     } else {
-      // Unknown format - try to construct from available data
-      throw new Error('Unexpected response format from AI');
+      // Unknown format - log what we received and try to construct from available data
+      console.error('   ❌ Unexpected response format. Received keys:', Object.keys(parsed));
+      console.error('   Response preview:', JSON.stringify(parsed).substring(0, 500));
+      throw new Error('Unexpected response format from AI. Expected "resume_edits" or "suggested_edits" or "gaps" array.');
     }
   } catch (error) {
     console.error('Error parsing AI response:', error);
