@@ -1,10 +1,8 @@
 // ResumeFit Custom AI API Service
-// Uses vector database for RAG (Retrieval Augmented Generation)
+// Uses OpenAI embeddings for RAG (Retrieval Augmented Generation)
 
 import express from 'express';
 import cors from 'cors';
-import { ChromaClient } from 'chromadb';
-import { pipeline } from '@xenova/transformers';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
 
@@ -55,199 +53,98 @@ if (OPENAI_API_KEY && OPENAI_API_KEY.length > 0) {
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Initialize ChromaDB (local vector database)
-const chromaClient = new ChromaClient({
-  path: process.env.CHROMA_PATH || 'http://localhost:8000'
-});
-
-const COLLECTION_NAME = 'resumefit_knowledge';
-
-// Initialize embedding model (local, no API key needed)
-let embeddingPipeline = null;
-let embeddingModel = null;
+// In-memory vector store using OpenAI embeddings
+const vectorStore = new Map(); // sessionId -> { chunks: [{ text, embedding, metadata }] }
+const OPENAI_EMBEDDING_MODEL = 'text-embedding-3-small'; // Cost-effective and fast
 
 /**
- * Initialize embedding model
- * Uses local transformer model - no API key required
+ * Generate embeddings using OpenAI API
  */
-async function initializeEmbeddingModel() {
+async function generateEmbedding(text) {
+  if (!openaiClient) {
+    throw new Error('OpenAI client not initialized. Please set OPENAI_API_KEY environment variable.');
+  }
+  
   try {
-    console.log('Loading embedding model...');
-    // Using a lightweight local embedding model
-    embeddingPipeline = await pipeline(
-      'feature-extraction',
-      'Xenova/all-MiniLM-L6-v2' // Lightweight, fast, local model
-    );
-    console.log('Embedding model loaded successfully');
+    const response = await openaiClient.embeddings.create({
+      model: OPENAI_EMBEDDING_MODEL,
+      input: text,
+    });
+    
+    return response.data[0].embedding;
   } catch (error) {
-    console.error('Failed to load embedding model:', error);
+    console.error('Error generating embedding:', error.message);
     throw error;
   }
 }
 
-/**
- * Generate embeddings for text
- */
-async function generateEmbedding(text) {
-  if (!embeddingPipeline) {
-    await initializeEmbeddingModel();
-  }
-  
-  const output = await embeddingPipeline(text, {
-    pooling: 'mean',
-    normalize: true,
-  });
-  
-  return Array.from(output.data);
-}
-
-let chromaAvailable = false;
-let chromaReconnectAttempts = 0;
-const MAX_CHROMA_RECONNECT_ATTEMPTS = 3;
 
 /**
- * Check ChromaDB health and reconnect if needed
+ * Store chunks in in-memory vector store
  */
-async function checkChromaHealth() {
+async function storeInVectorStore(sessionId, chunks) {
   try {
-    const heartbeatPromise = chromaClient.heartbeat();
-    const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('Connection timeout')), 5000)
-    );
-    
-    await Promise.race([heartbeatPromise, timeoutPromise]);
-    
-    if (!chromaAvailable) {
-      console.log('✅ ChromaDB reconnected!');
-      chromaAvailable = true;
-      chromaReconnectAttempts = 0;
-      // Ensure collection exists
-      await getOrCreateCollection();
-    }
-    return true;
-  } catch (error) {
-    if (chromaAvailable) {
-      console.warn(`⚠️  ChromaDB connection lost: ${error.message}`);
-      chromaAvailable = false;
-    }
-    return false;
-  }
-}
-
-/**
- * Initialize or get ChromaDB collection with automatic reconnection
- */
-async function getOrCreateCollection() {
-  // If not available, try to reconnect
-  if (!chromaAvailable) {
-    const reconnected = await checkChromaHealth();
-    if (!reconnected) {
-      return null; // Still not available
-    }
-  }
-  
-  try {
-    // Try to get existing collection
-    const collection = await chromaClient.getOrCreateCollection({
-      name: COLLECTION_NAME,
-      metadata: { description: 'ResumeFit knowledge base' }
-    });
-    return collection;
-  } catch (error) {
-    console.warn('ChromaDB error:', error.message);
-    chromaAvailable = false;
-    
-    // Try to reconnect once
-    if (chromaReconnectAttempts < MAX_CHROMA_RECONNECT_ATTEMPTS) {
-      chromaReconnectAttempts++;
-      console.log(`🔄 Attempting to reconnect to ChromaDB (attempt ${chromaReconnectAttempts}/${MAX_CHROMA_RECONNECT_ATTEMPTS})...`);
-      const reconnected = await checkChromaHealth();
-      if (reconnected) {
-        // Retry getting collection
-        try {
-          return await chromaClient.getOrCreateCollection({
-            name: COLLECTION_NAME,
-            metadata: { description: 'ResumeFit knowledge base' }
-          });
-        } catch (retryError) {
-          console.warn('ChromaDB retry failed:', retryError.message);
-        }
-      }
+    if (!openaiClient) {
+      console.warn('⚠️  OpenAI client not available, skipping vector storage');
+      return false;
     }
     
-    return null; // Gracefully handle ChromaDB unavailability
-  }
-}
-
-/**
- * Store resume/job data in vector database with automatic reconnection
- */
-async function storeInVectorDB(text, metadata) {
-  try {
-    const collection = await getOrCreateCollection();
-    if (!collection) {
-      // Try one more time to reconnect
-      const reconnected = await checkChromaHealth();
-      if (reconnected) {
-        const retryCollection = await getOrCreateCollection();
-        if (!retryCollection) {
-          return false;
-        }
-        // Continue with retryCollection
-        const embedding = await generateEmbedding(text);
-        await retryCollection.add({
-          ids: [`doc_${Date.now()}_${Math.random()}`],
-          embeddings: [embedding],
-          documents: [text],
-          metadatas: [metadata],
+    // Generate embeddings for all chunks in parallel (with batching)
+    const batchSize = 10;
+    const storedChunks = [];
+    
+    for (let i = 0; i < chunks.length; i += batchSize) {
+      const batch = chunks.slice(i, i + batchSize);
+      const texts = batch.map(chunk => chunk.text);
+      
+      try {
+        // Generate embeddings for batch
+        const response = await openaiClient.embeddings.create({
+          model: OPENAI_EMBEDDING_MODEL,
+          input: texts,
         });
-        return true;
+        
+        // Store chunks with embeddings
+        batch.forEach((chunk, idx) => {
+          storedChunks.push({
+            text: chunk.text,
+            embedding: response.data[idx].embedding,
+            metadata: chunk.metadata || {},
+          });
+        });
+  } catch (error) {
+        console.warn(`Error generating embeddings for batch ${i / batchSize + 1}:`, error.message);
       }
-      return false; // ChromaDB not available
     }
     
-    const embedding = await generateEmbedding(text);
-    
-    await collection.add({
-      ids: [`doc_${Date.now()}_${Math.random()}`],
-      embeddings: [embedding],
-      documents: [text],
-      metadatas: [metadata],
-    });
+    // Store in memory
+    if (!vectorStore.has(sessionId)) {
+      vectorStore.set(sessionId, { chunks: [] });
+    }
+    vectorStore.get(sessionId).chunks.push(...storedChunks);
     
     return true;
   } catch (error) {
-    console.error('Error storing in vector DB:', error.message);
-    // Try to reconnect on error
-    chromaAvailable = false;
-    const reconnected = await checkChromaHealth();
-    if (reconnected) {
-      console.log('🔄 ChromaDB reconnected, but storage failed. Will retry on next operation.');
-    }
+    console.error('Error storing in vector store:', error.message);
     return false;
   }
 }
 
 /**
- * Retrieve similar content from vector database with timeout and auto-reconnect
+ * Retrieve similar content from in-memory vector store
  */
-async function retrieveSimilarContent(queryText, topK = 5, timeoutMs = 5000) {
+async function retrieveSimilarContent(sessionId, queryText, topK = 5, filterMetadata = null, timeoutMs = 5000) {
   try {
-    let collection = await getOrCreateCollection();
-    if (!collection) {
-      // Try to reconnect once
-      const reconnected = await checkChromaHealth();
-      if (reconnected) {
-        collection = await getOrCreateCollection();
-        if (!collection) {
-          return []; // Still not available
-        }
-      } else {
-      return []; // ChromaDB not available, return empty
-      }
+    if (!openaiClient) {
+      return [];
     }
     
-    // Add timeout to embedding generation
+    const sessionData = vectorStore.get(sessionId);
+    if (!sessionData || !sessionData.chunks || sessionData.chunks.length === 0) {
+      return [];
+    }
+    
+    // Generate query embedding
     const embeddingPromise = generateEmbedding(queryText);
     const embeddingTimeout = new Promise((_, reject) => 
       setTimeout(() => reject(new Error('Embedding generation timeout')), timeoutMs)
@@ -255,23 +152,31 @@ async function retrieveSimilarContent(queryText, topK = 5, timeoutMs = 5000) {
     
     const queryEmbedding = await Promise.race([embeddingPromise, embeddingTimeout]);
     
-    // Add timeout to query
-    const queryPromise = collection.query({
-      queryEmbeddings: [queryEmbedding],
-      nResults: topK,
-    });
-    const queryTimeout = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('Query timeout')), timeoutMs)
-    );
+    // Filter chunks by metadata if provided
+    let chunksToSearch = sessionData.chunks;
+    if (filterMetadata) {
+      chunksToSearch = chunksToSearch.filter(chunk => {
+        return Object.keys(filterMetadata).every(key => 
+          chunk.metadata[key] === filterMetadata[key]
+        );
+      });
+    }
     
-    const results = await Promise.race([queryPromise, queryTimeout]);
+    // Calculate similarities
+    const similarities = chunksToSearch.map(chunk => ({
+      text: chunk.text,
+      similarity: cosineSimilarity(queryEmbedding, chunk.embedding),
+      metadata: chunk.metadata,
+    }));
     
-    return results.documents[0] || [];
+    // Sort by similarity and return top K
+    similarities.sort((a, b) => b.similarity - a.similarity);
+    return similarities.slice(0, topK).map(item => item.text);
   } catch (error) {
     if (error.message.includes('timeout')) {
       console.warn(`RAG retrieval timeout for query (${queryText.substring(0, 50)}...):`, error.message);
     } else {
-    console.error('Error retrieving from vector DB:', error);
+      console.error('Error retrieving from vector store:', error.message);
     }
     return [];
   }
@@ -418,56 +323,56 @@ function chunkJobDescription(jobText) {
 }
 
 /**
- * Store resume chunks in vector DB
+ * Store resume chunks in vector store
  */
-async function storeResumeChunks(resumeText, resumeId) {
+async function storeResumeChunks(sessionId, resumeText, resumeId) {
   const chunks = chunkResume(resumeText);
-  const stored = [];
-  
-  for (const chunk of chunks) {
-    const success = await storeInVectorDB(chunk.text, {
+  const chunksWithMetadata = chunks.map(chunk => ({
+    text: chunk.text,
+    metadata: {
       ...chunk.metadata,
       resumeId: resumeId,
+      type: 'resume',
       timestamp: new Date().toISOString(),
-    });
-    if (success) stored.push(chunk);
-  }
+    },
+  }));
   
-  return stored;
+  const success = await storeInVectorStore(sessionId, chunksWithMetadata);
+  return success ? chunks : [];
 }
 
 /**
- * Store job description chunks in vector DB
+ * Store job description chunks in vector store
  */
-async function storeJobChunks(jobText, jobId) {
+async function storeJobChunks(sessionId, jobText, jobId) {
   const chunks = chunkJobDescription(jobText);
-  const stored = [];
-  
-  for (const chunk of chunks) {
-    const success = await storeInVectorDB(chunk.text, {
+  const chunksWithMetadata = chunks.map(chunk => ({
+    text: chunk.text,
+    metadata: {
       ...chunk.metadata,
       jobId: jobId,
+      type: 'job',
       timestamp: new Date().toISOString(),
-    });
-    if (success) stored.push(chunk);
-  }
+    },
+  }));
   
-  return stored;
+  const success = await storeInVectorStore(sessionId, chunksWithMetadata);
+  return success ? chunks : [];
 }
 
 /**
  * Retrieve relevant resume sections for a job requirement using RAG
  */
-async function retrieveRelevantResumeSections(jobRequirement, topK = 5, timeoutMs = 3000) {
+async function retrieveRelevantResumeSections(sessionId, jobRequirement, topK = 5, timeoutMs = 3000) {
   try {
     const queryText = `resume section matching job requirement: ${jobRequirement}`;
-    const results = await retrieveSimilarContent(queryText, topK, timeoutMs);
+    const results = await retrieveSimilarContent(sessionId, queryText, topK, { type: 'resume' }, timeoutMs);
     return results || [];
   } catch (error) {
     if (error.message.includes('timeout')) {
       console.warn(`RAG timeout for resume sections (requirement: ${jobRequirement.substring(0, 50)}...)`);
     } else {
-    console.error('Error retrieving relevant resume sections:', error);
+      console.error('Error retrieving relevant resume sections:', error.message);
     }
     return [];
   }
@@ -476,16 +381,16 @@ async function retrieveRelevantResumeSections(jobRequirement, topK = 5, timeoutM
 /**
  * Retrieve relevant job requirements for a resume section using RAG
  */
-async function retrieveRelevantJobRequirements(resumeSection, topK = 5, timeoutMs = 3000) {
+async function retrieveRelevantJobRequirements(sessionId, resumeSection, topK = 5, timeoutMs = 3000) {
   try {
     const queryText = `job requirement matching resume: ${resumeSection}`;
-    const results = await retrieveSimilarContent(queryText, topK, timeoutMs);
+    const results = await retrieveSimilarContent(sessionId, queryText, topK, { type: 'job' }, timeoutMs);
     return results || [];
   } catch (error) {
     if (error.message.includes('timeout')) {
       console.warn(`RAG timeout for job requirements (section: ${resumeSection.substring(0, 50)}...)`);
     } else {
-    console.error('Error retrieving relevant job requirements:', error);
+      console.error('Error retrieving relevant job requirements:', error.message);
     }
     return [];
   }
@@ -1277,15 +1182,15 @@ async function analyzeResume(resumeText, jobText) {
   
   // Run storage operations in parallel with timeout
   const storagePromise = Promise.all([
-    storeResumeChunks(resumeText, resumeId),
-    storeJobChunks(jobText, jobId)
+    storeResumeChunks(sessionId, resumeText, resumeId),
+    storeJobChunks(sessionId, jobText, jobId)
   ]);
   
   const storageTimeout = new Promise((resolve) => {
     setTimeout(() => {
-      console.warn('⚠️  Vector DB storage taking too long, continuing without it...');
+      console.warn('⚠️  Vector store storage taking too long, continuing without it...');
       resolve([[], []]);
-    }, 10000); // 10 second timeout for storage
+    }, 30000); // 30 second timeout for storage (OpenAI API calls)
   });
   
   const [resumeChunks, jobChunks] = await Promise.race([storagePromise, storageTimeout]);
@@ -1408,7 +1313,7 @@ async function analyzeResume(resumeText, jobText) {
   const resumeSectionPromises = keyResumeSections.map(async (resumeSection) => {
     try {
       const relevantJobRequirements = await Promise.race([
-        retrieveRelevantJobRequirements(resumeSection, 10), // Increased to get more comprehensive matches
+        retrieveRelevantJobRequirements(sessionId, resumeSection, 10), // Increased to get more comprehensive matches
         new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 5000))
       ]);
     if (relevantJobRequirements.length > 0) {
@@ -1444,7 +1349,7 @@ async function analyzeResume(resumeText, jobText) {
   const jobRequirementPromises = keyJobRequirements.map(async (requirement) => {
     try {
       const relevantResumeSections = await Promise.race([
-        retrieveRelevantResumeSections(requirement, 10), // Increased to get more comprehensive matches
+        retrieveRelevantResumeSections(sessionId, requirement, 10), // Increased to get more comprehensive matches
         new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 5000))
       ]);
       if (relevantResumeSections.length > 0) {
@@ -1725,16 +1630,24 @@ CRITICAL: Return ONLY valid JSON. Start with { and end with }. No markdown, no c
   // NO TRUNCATION - Full resume text is always included
   const fullResumeText = resumeText;
 
-  const userPrompt = `You are a technical resume–job alignment evaluator specializing in extracting and matching technical requirements.
+  const userPrompt = `You are a technical resume–job alignment evaluator specializing in analyzing ACTUAL WORK EXPERIENCES and PROJECTS, not just keywords.
 
-Your task is to analyze a JOB_DESCRIPTION and a RESUME and produce precise, evidence-based feedback with a STRONG FOCUS ON TECHNICAL ASPECTS.
+Your task is to analyze a JOB_DESCRIPTION and a RESUME and produce precise, evidence-based feedback that focuses on REFORMATTING and ENHANCING the candidate's ACTUAL work experiences and projects.
 
-TECHNICAL FOCUS PRIORITY:
-1. Extract ALL technical requirements (programming languages, frameworks, tools, platforms, methodologies)
-2. Identify technical gaps where the resume lacks specific technologies mentioned in the job
-3. Suggest technical improvements that incorporate exact technical terminology from the job description
-4. Prioritize technical skills, certifications, and tools that will make the resume stand out
-5. Use RAG context to find semantic matches even when technical terms are worded differently
+CORE PRINCIPLE: The candidate's work experiences and projects are the MOST IMPORTANT part of their resume. Your job is to:
+1. UNDERSTAND what they actually did (read their experiences and projects completely)
+2. MATCH their actual work to job requirements (semantic matching, not just keyword matching)
+3. REFORMAT their existing experiences to better align with job requirements (keep their actual work, just change the wording)
+4. ENHANCE their existing experiences with specific technologies/details from job requirements (if they likely used them)
+5. Only suggest adding NEW content if they truly don't have relevant experience
+
+EXPERIENCE-FOCUSED PRIORITY:
+1. Analyze ACTUAL work experiences first - what did they really do? What technologies did they actually use?
+2. Analyze ACTUAL projects second - what did they build? What problems did they solve?
+3. Match experiences/projects to job requirements semantically - understand the meaning, not just keywords
+4. Reformat existing experiences to match job terminology - they did the work, just word it differently
+5. Enhance existing experiences with specific job technologies - if it's reasonable they used them
+6. Skills section is LAST RESORT - prefer showing skills through actual work experiences
 
 === FULL JOB DESCRIPTION (Complete Text - No Limits) ===
 ${fullJobTextForPrompt}
@@ -1746,22 +1659,24 @@ ${keyRequirementsSummary || 'See full job description above for all technical re
 
 NOTE: Focus on extracting technical aspects: programming languages, frameworks, tools, platforms, databases, cloud services, methodologies, certifications, and specific technical skills.
 
-=== RESUME STRUCTURE ===
+=== RESUME STRUCTURE (FOCUS ON EXPERIENCES AND PROJECTS) ===
 Summary: ${resumeStructure.hasSummary ? 'EXISTS' : 'MISSING'}
 ${resumeStructure.hasSummary ? `Current: "${resumeStructure.summaryText.substring(0, 150)}"` : ''}
 
 Work Experience: ${resumeStructure.experienceEntries.length} entries
-${resumeStructure.detailedExperiences && resumeStructure.detailedExperiences.length > 0 ? `\nDETAILED WORK EXPERIENCES (showing max 5 most recent):\n${resumeStructure.detailedExperiences.slice(0, 5).map((exp, idx) => 
-  `${idx + 1}. ${exp.title || 'Title N/A'} at ${exp.company || 'Company N/A'} (${exp.dates || 'Dates N/A'})\n   Technologies: ${exp.technologies && exp.technologies.length > 0 ? exp.technologies.slice(0, 5).join(', ') : 'None identified'}${exp.technologies && exp.technologies.length > 5 ? '...' : ''}\n   Description: "${(exp.description || '').substring(0, MAX_EXPERIENCE_DESC)}${(exp.description || '').length > MAX_EXPERIENCE_DESC ? '...' : ''}"`
-).join('\n\n')}` : ''}
+${resumeStructure.detailedExperiences && resumeStructure.detailedExperiences.length > 0 ? `\n⚠️  CRITICAL: Analyze these ACTUAL work experiences carefully. These are the MOST IMPORTANT part of the resume.\n\nDETAILED WORK EXPERIENCES (ALL entries - analyze each one):\n${resumeStructure.detailedExperiences.map((exp, idx) => 
+  `${idx + 1}. ${exp.title || 'Title N/A'} at ${exp.company || 'Company N/A'} (${exp.dates || 'Dates N/A'})\n   Technologies identified: ${exp.technologies && exp.technologies.length > 0 ? exp.technologies.join(', ') : 'None identified'}\n   FULL Description: "${exp.description || 'No description'}"\n   \n   YOUR TASK: Read this experience completely. Understand what they ACTUALLY did. Match it to job requirements semantically. Suggest how to REFORMAT this experience to better match job requirements while keeping their actual work truthful.`
+).join('\n\n')}` : '\n⚠️  No work experiences found. Focus on projects and skills.'}
 
 Projects: ${resumeStructure.detailedProjects && resumeStructure.detailedProjects.length > 0 ? resumeStructure.detailedProjects.length : 0} projects identified
-${resumeStructure.detailedProjects && resumeStructure.detailedProjects.length > 0 ? `\nDETAILED PROJECTS (showing max 3 most relevant):\n${resumeStructure.detailedProjects.slice(0, 3).map((proj, idx) => 
-  `${idx + 1}. ${proj.name || 'Project N/A'}\n   Technologies: ${proj.technologies && proj.technologies.length > 0 ? proj.technologies.slice(0, 5).join(', ') : 'None identified'}${proj.technologies && proj.technologies.length > 5 ? '...' : ''}\n   Description: "${(proj.description || '').substring(0, MAX_PROJECT_DESC)}${(proj.description || '').length > MAX_PROJECT_DESC ? '...' : ''}"`
-).join('\n\n')}` : ''}
+${resumeStructure.detailedProjects && resumeStructure.detailedProjects.length > 0 ? `\n⚠️  CRITICAL: Analyze these ACTUAL projects carefully. These show what the candidate actually built.\n\nDETAILED PROJECTS (ALL projects - analyze each one):\n${resumeStructure.detailedProjects.map((proj, idx) => 
+  `${idx + 1}. ${proj.name || 'Project N/A'}\n   Technologies identified: ${proj.technologies && proj.technologies.length > 0 ? proj.technologies.join(', ') : 'None identified'}\n   FULL Description: "${proj.description || 'No description'}"\n   \n   YOUR TASK: Read this project completely. Understand what they ACTUALLY built. Match it to job requirements semantically. Suggest how to REFORMAT this project description to better match job requirements while keeping their actual work truthful.`
+).join('\n\n')}` : '\n⚠️  No projects found. Focus on work experiences and skills.'}
 
 Skills: ${resumeStructure.skillsSection ? 'EXISTS' : 'MISSING'}
 ${resumeStructure.skillsSection ? `Current: "${resumeStructure.skillsSection.substring(0, 150)}"` : ''}
+
+⚠️  NOTE: Skills section is LESS IMPORTANT than actual work experiences and projects. Prefer showing skills through reformatted experiences/projects rather than just listing them.
 
 === FULL RESUME TEXT (Complete Text - No Limits) ===
 ${fullResumeText}
@@ -1781,9 +1696,16 @@ The full job description and resume are available above for comprehensive analys
    - If you detect UI noise, list it in the "Ignored Noise" section.
 
 2. You may ONLY recommend a skill, keyword, or experience if:
-   - It appears explicitly in the JOB_DESCRIPTION (quote it exactly, ≤20 words), AND
+   - It appears EXPLICITLY in the JOB_DESCRIPTION (quote it exactly, no word limit), AND
    - It is a real professional skill, technology, research area, or domain concept, AND
-   - It is missing or weakly represented in the RESUME.
+   - It is missing or weakly represented in the RESUME, AND
+   - ⚠️  CRITICAL: You can quote the EXACT requirement from the JOB_DESCRIPTION (not from the resume)
+   
+   NEVER recommend something that:
+   - Is only mentioned in the resume but not in the job description
+   - You inferred from the resume content
+   - You assumed based on the resume
+   - Cannot be found by searching the job description text
 
 3. Every recommendation MUST be justified with evidence:
    - Quote the exact phrase from the JOB_DESCRIPTION (≤20 words).
@@ -1794,6 +1716,13 @@ The full job description and resume are available above for comprehensive analys
 5. Do NOT give generic advice (e.g., "tailor your resume", "highlight impact").
 
 6. Do NOT infer requirements that are not stated in the JOB_DESCRIPTION.
+   
+7. ⚠️  MOST CRITICAL: The JOB_DESCRIPTION is the ONLY source of truth for requirements.
+   - NEVER use resume content to determine what the job requires
+   - NEVER create suggestions based on what's in the resume if it's not in the job description
+   - If "data engineering" is in the resume but NOT in the job description, DO NOT suggest it
+   - If you see something in the resume and think "this should be in the job", SKIP it - it's not a requirement
+   - Every requirement MUST be explicitly stated in the JOB_DESCRIPTION
 
 === ANALYSIS STEPS ===
 
@@ -1801,49 +1730,110 @@ STEP 1: Filter UI noise from job description
 - Identify and list all UI/boilerplate terms (e.g., "Apply now", "opens in a new window", "Less", "More", navigation elements)
 - These will be IGNORED in all analysis
 
-STEP 2: Extract ALL technical requirements from job description (quote exactly, no word limit)
-- Extract ALL technologies, skills, qualifications, responsibilities, frameworks, tools, methodologies that are:
-  - Explicitly stated in the job description (even if mentioned once)
+STEP 2: Extract ALL technical requirements from job description ONLY (quote exactly, no word limit)
+⚠️  CRITICAL: ONLY extract requirements that are EXPLICITLY STATED in the JOB DESCRIPTION. NEVER infer, assume, or add requirements based on the resume.
+
+VALIDATION FOR EACH REQUIREMENT:
+- Can I find this EXACT requirement in the job description? (If no, DO NOT include it)
+- Is this requirement explicitly stated, not just implied? (If only implied, DO NOT include it)
+- Am I confusing resume content with job requirements? (If yes, DO NOT include it)
+
+- Extract ONLY technologies, skills, qualifications, responsibilities, frameworks, tools, methodologies that are:
+  - EXPLICITLY STATED in the job description (quote the exact text)
   - Real professional skills/technologies (not UI elements)
   - Technical in nature (programming languages, frameworks, tools, platforms, certifications, methodologies)
   - Not in the ignored noise list
+  - NOT from the resume (ONLY from job description)
+  
 - Pay special attention to:
-  - Programming languages and versions (e.g., "Python 3.8+", "Java 11", "TypeScript")
-  - Frameworks and libraries (e.g., "React", "Django", "Spring Boot", "TensorFlow")
-  - Cloud platforms and services (e.g., "AWS", "Azure", "GCP", "Kubernetes", "Docker")
-  - Databases and data technologies (e.g., "PostgreSQL", "MongoDB", "Redis", "Kafka")
-  - Tools and methodologies (e.g., "CI/CD", "Agile", "Scrum", "Git", "Jenkins")
-  - Certifications and qualifications (e.g., "AWS Certified", "PMP", "CISSP")
-- Create a comprehensive numbered list with exact quotes (no truncation)
+  - Programming languages and versions (e.g., "Python 3.8+", "Java 11", "TypeScript") - ONLY if mentioned in job
+  - Frameworks and libraries (e.g., "React", "Django", "Spring Boot", "TensorFlow") - ONLY if mentioned in job
+  - Cloud platforms and services (e.g., "AWS", "Azure", "GCP", "Kubernetes", "Docker") - ONLY if mentioned in job
+  - Databases and data technologies (e.g., "PostgreSQL", "MongoDB", "Redis", "Kafka") - ONLY if mentioned in job
+  - Tools and methodologies (e.g., "CI/CD", "Agile", "Scrum", "Git", "Jenkins") - ONLY if mentioned in job
+  - Certifications and qualifications (e.g., "AWS Certified", "PMP", "CISSP") - ONLY if mentioned in job
+  - Domain areas (e.g., "data engineering", "machine learning", "web development") - ONLY if mentioned in job
 
-STEP 3: Map resume content to job requirements (quote exactly)
-For each requirement from Step 2, check:
-- Is it mentioned in work experience? Quote the EXACT work experience entry and line
-- Is it mentioned in projects? Quote the EXACT project description
-- Is it mentioned in skills section? Quote the EXACT text
-- If not mentioned, write "NOT FOUND IN RESUME"
+- Create a comprehensive numbered list with exact quotes from the JOB DESCRIPTION ONLY (no truncation)
+- For each requirement, include the EXACT quote from the job description showing where it appears
 
-STEP 4: Identify alignment gaps (evidence-based only)
+STEP 3: Map resume content to job requirements (analyze actual experiences and projects)
+For each requirement from Step 2, you MUST:
+1. Check work experiences FIRST - look at what the candidate ACTUALLY did:
+   - Read each work experience entry COMPLETELY
+   - Understand the CONTEXT and MEANING of their work (not just keywords)
+   - Identify if their actual work experience MATCHES the requirement semantically
+   - Quote the EXACT work experience entry that relates to this requirement
+   - If the experience is relevant but worded differently, note how it could be reformatted
+   
+2. Check projects SECOND - analyze what they actually built:
+   - Read each project description COMPLETELY
+   - Understand what technologies they used and what problems they solved
+   - Identify if their project work MATCHES the requirement semantically
+   - Quote the EXACT project description that relates to this requirement
+   - If the project is relevant but worded differently, note how it could be reformatted
+   
+3. Check skills section LAST - only if not found in experiences/projects:
+   - Quote the EXACT text from skills section
+   - Note if the skill is listed but not demonstrated in experiences/projects
+   
+4. If not found anywhere, write "NOT FOUND IN RESUME"
+
+CRITICAL: Focus on SEMANTIC MATCHING - understand what the candidate actually did, not just if they used the exact same words. Their experience might be relevant even if worded differently.
+
+STEP 4: Identify alignment gaps (evidence-based, experience-focused)
 For each requirement:
 - If NOT FOUND in resume: This is a gap (only if it's a real requirement from Step 2)
-- If found but vague/weak: This is a gap (only if you can quote evidence)
-- If found and well-stated: No gap
+- If found in experiences/projects but worded vaguely: This is a gap - suggest reformatting to match job wording
+- If found in experiences/projects but missing key details: This is a gap - suggest adding specific technologies/achievements
+- If found in skills only (not demonstrated in experiences): This is a gap - suggest adding to experience section
+- If found and well-stated in experiences/projects: No gap
 
-STEP 5: Create comprehensive suggestions (minimum 5, maximum 15, only if evidence supports)
-- Focus on TECHNICAL aspects that will make the resume stand out
-- Prioritize missing technical skills, tools, frameworks, and methodologies
-- Ensure suggestions incorporate exact technical terminology from the job description
+PRIORITY: Gaps in actual work experiences and projects are MORE IMPORTANT than gaps in skills section. Focus on what they actually did, not just what they claim to know.
+
+STEP 5: Create comprehensive suggestions (minimum 5, maximum 15, experience-focused)
+PRIORITY ORDER (most important first):
+1. REFORMAT EXISTING WORK EXPERIENCES - If the candidate has relevant experience but it's worded differently:
+   - Analyze their actual work and reformat it to match job requirements
+   - Keep their actual achievements and responsibilities
+   - Just change the wording to align with job description terminology
+   - Example: If they "built web apps" and job requires "Django framework", reformat to "built web applications using Django framework"
+   
+2. ENHANCE EXISTING WORK EXPERIENCES - If the experience is relevant but missing details:
+   - Add specific technologies mentioned in job requirements
+   - Add quantifiable achievements that match job scope
+   - Add responsibilities that align with job requirements
+   - Keep their actual work, just make it more specific
+   
+3. REFORMAT EXISTING PROJECTS - Similar to work experiences:
+   - Reformat project descriptions to match job terminology
+   - Add technologies/tools from job requirements if they were actually used
+   - Emphasize aspects that match job requirements
+   
+4. ADD TO EXPERIENCE SECTION - If they have the skill but haven't demonstrated it:
+   - Suggest adding a bullet point to existing work experience
+   - Base it on what they likely did (infer from their other work)
+   - Don't make things up - only suggest if it's reasonable given their background
+   
+5. SKILLS SECTION - Only as last resort:
+   - Only if the skill is truly missing and can't be added to experiences
+
 For EACH suggestion, you MUST provide:
-1. section: "experience" | "projects" | "skills" | "summary"
+1. section: "experience" | "projects" | "skills" | "summary" (prefer "experience" and "projects")
 2. job_requirement: Copy the EXACT text from the job description (no word limit - include full technical requirement)
 3. before: Copy the EXACT text from the resume that needs changing (or "null" if adding new)
 4. after: Write replacement text that:
-   - Incorporates the EXACT keywords/phrases from the job requirement
+   - For EXPERIENCE/PROJECTS: Reformats their ACTUAL work to match job requirements
+   - Keeps their real achievements and responsibilities
+   - Incorporates EXACT keywords/phrases from the job requirement
    - Uses similar phrasing/wording from the job description
-   - Maintains the resume's existing style
-   - For work experience: Shows how to reformat existing experience to match job requirements
-5. reason: Explain HOW this specific change addresses the specific job requirement, with evidence quotes
-6. alignment_impact: Explain how this improves alignment with evidence
+   - Maintains the resume's existing style and truthfulness
+   - NEVER invents work they didn't do - only reformat what they actually did
+5. reason: Explain:
+   - What they ACTUALLY did (quote from resume)
+   - How it relates to the job requirement (semantic connection)
+   - Why reformatting helps (makes the connection explicit)
+6. alignment_impact: Explain how reformatting their actual experience improves alignment
 7. priority: "high" if required qualification, "medium" if preferred, "low" if nice-to-have
 8. job_keywords_addressed: List ALL relevant technical keywords/phrases from the job description (no limit - be comprehensive)
 
@@ -1852,18 +1842,37 @@ QUALITY BAR:
 - Do NOT create suggestions without evidence quotes
 - Do NOT recommend skills/technologies that are not explicitly in the job description
 
-VALIDATION CHECK - Before including a suggestion, ask:
-- Can I quote the exact job requirement? (If no, skip this suggestion)
-- Can I quote the exact resume text to change? (If no, but it's a missing requirement, use "null")
-- Does my "after" text incorporate the exact job requirement wording? (If no, rewrite it)
-- Is this suggestion tied to a SPECIFIC job requirement? (If no, skip it)
+VALIDATION CHECK - Before including a suggestion, ask (ALL must be YES):
+1. Can I quote the EXACT job requirement from the JOB DESCRIPTION? 
+   - Must be able to copy-paste the exact text from job description
+   - If I can't find it in the job description, SKIP this suggestion
+   - If I'm inferring it from the resume, SKIP this suggestion
+   
+2. Is this requirement EXPLICITLY STATED in the job description?
+   - Not implied, not inferred, not assumed
+   - Must be directly written in the job description
+   - If not explicit, SKIP this suggestion
+   
+3. Am I confusing resume content with job requirements?
+   - Did I see this in the resume and assume it's a job requirement? (If yes, SKIP)
+   - Is this requirement ONLY in the resume, not in the job description? (If yes, SKIP)
+   - Can I point to the EXACT line in the job description? (If no, SKIP)
+   
+4. Can I quote the exact resume text to change? (If no, but it's a missing requirement, use "null")
+5. For EXPERIENCE/PROJECT suggestions: Does the candidate actually have relevant work? (If no, don't suggest reformatting - suggest adding new content or skip)
+6. Does my "after" text reformat their ACTUAL work to match job requirements? (If no, rewrite it)
+7. Am I just adding keywords, or am I reformatting actual experiences? (Prefer reformatting over keyword stuffing)
+8. Is this suggestion tied to a SPECIFIC job requirement from the JOB DESCRIPTION? (If no, SKIP it)
+9. Am I being truthful? (Never suggest work they didn't do - only reformat what they actually did)
 
-EXAMPLE - GOOD (follow this format exactly):
+EXAMPLE - GOOD (follow this format exactly - focuses on actual experience):
 Job requirement: "Required: 5+ years of Python development experience, Django framework, PostgreSQL database, experience designing and implementing scalable web applications"
 Resume work experience: "Software Engineer | Tech Corp | 2020-2023
 - Developed web applications using various technologies
 - Built REST APIs and managed databases
 - Worked on improving application performance"
+
+Analysis: The candidate ACTUALLY built web applications, REST APIs, and worked with databases. They likely used Python/Django (common for web apps) and PostgreSQL (common database). This is a REFORMATTING suggestion, not adding new work.
 
 Suggestion:
 {
@@ -1871,11 +1880,36 @@ Suggestion:
   "job_requirement": "Required: 5+ years of Python development experience, Django framework, PostgreSQL database, experience designing and implementing scalable web applications",
   "before": "Software Engineer | Tech Corp | 2020-2023\n- Developed web applications using various technologies\n- Built REST APIs and managed databases\n- Worked on improving application performance",
   "after": "Software Engineer | Tech Corp | 2020-2023 (5+ years)\n- Designed and implemented scalable web applications using Python and Django framework\n- Built REST APIs with Django REST framework and managed PostgreSQL databases\n- Optimized application performance and database queries for scalability",
-  "reason": "The job requires '5+ years of Python development experience, Django framework, PostgreSQL database, experience designing and implementing scalable web applications'. The resume mentions relevant work but doesn't specify Python, Django, PostgreSQL, or use the job's exact phrasing 'designed and implemented scalable web applications'. Reformatting the work experience to include these specific technologies and job description wording directly addresses the requirement.",
-  "alignment_impact": "Explicitly states the required technologies (Python, Django, PostgreSQL) using job description wording, matches the experience requirement (5+ years), and uses the exact phrase 'designed and implemented scalable web applications' from the job description, directly addressing all key job requirements",
+  "reason": "The candidate's actual work ('Developed web applications', 'Built REST APIs', 'managed databases') aligns with the job requirement for 'Python development experience, Django framework, PostgreSQL database, experience designing and implementing scalable web applications'. The resume describes relevant work but uses generic wording. Reformatting to specify Python, Django, and PostgreSQL (which are standard for this type of work) and using the job's exact phrasing 'designed and implemented scalable web applications' makes the connection explicit while maintaining truthfulness about their actual work.",
+  "alignment_impact": "Reformats the candidate's actual experience to explicitly match job requirements. They did the work, but the resume didn't use the job's terminology. This change makes their relevant experience immediately clear to recruiters while staying truthful to what they actually did.",
   "priority": "high",
   "job_keywords_addressed": ["5+ years", "Python", "Django", "PostgreSQL", "designed and implemented scalable web applications"]
 }
+
+EXAMPLE - BAD (DO NOT DO THIS - using resume content as job requirement):
+Job description mentions: "Experience with Python, SQL, and web development"
+Resume mentions: "Data Engineering Intern - worked with ETL processes"
+
+BAD Suggestion:
+{
+  "section": "experience",
+  "job_requirement": "Experience with data engineering, including ETL processes and data modeling",
+  "before": null,
+  "after": "Add data engineering experience...",
+  ...
+}
+
+This is REJECTED because:
+- "Data engineering" and "ETL processes" are NOT in the job description
+- The AI incorrectly used resume content to create a fake job requirement
+- The job requirement must be quoted EXACTLY from the job description
+- If data engineering isn't mentioned in the job description, it should NOT be suggested
+
+CORRECT Approach:
+- Only suggest requirements that are EXPLICITLY in the job description
+- If job says "Python, SQL, web development" - only suggest those
+- If resume has "data engineering" but job doesn't mention it - DO NOT suggest it
+- The job description is the SOURCE OF TRUTH, not the resume
 
 EXAMPLE - BAD (DO NOT DO THIS):
 {
@@ -1925,17 +1959,31 @@ You MUST return a JSON object with this EXACT structure:
   "ignored_noise": ["UI element 1", "UI element 2", ...]
 }
 
-CRITICAL: 
+CRITICAL RULES - YOU MUST FOLLOW THESE EXACTLY:
 - Return ONLY valid JSON matching the OUTPUT FORMAT above
 - No markdown, no code blocks, no explanations outside JSON
 - The "resume_edits" array is REQUIRED (minimum 5, maximum 15 - focus on technical improvements)
 - Follow all NON-NEGOTIABLE RULES strictly
 - Ignore UI noise (list in ignored_noise)
-- Only recommend skills/requirements explicitly in job description
-- Provide evidence quotes for every recommendation
-- Minimum 3 gaps if evidence supports, otherwise explain why
-- Maximum 15 suggestions (focus on technical aspects)
-- Skills section: max 18 total skills, grouped by category`;
+
+⚠️  MOST CRITICAL RULE - JOB DESCRIPTION IS THE SOURCE OF TRUTH:
+- ONLY recommend skills/requirements that are EXPLICITLY STATED in the JOB DESCRIPTION
+- NEVER infer, assume, or create requirements based on the resume
+- NEVER use resume content to determine what the job requires
+- For EVERY suggestion, you MUST be able to quote the EXACT requirement from the JOB DESCRIPTION
+- If a requirement is NOT in the job description, DO NOT suggest it - even if it's in the resume
+- If you can't find a requirement in the job description, it doesn't exist - SKIP that suggestion
+
+VALIDATION FOR EVERY SUGGESTION:
+1. Can I quote the EXACT requirement from the JOB DESCRIPTION? (If no, SKIP)
+2. Is this requirement EXPLICITLY STATED in the job description? (If no, SKIP)
+3. Am I confusing resume content with job requirements? (If yes, SKIP)
+4. Provide evidence quotes for every recommendation (must be from job description)
+5. Minimum 3 gaps if evidence supports, otherwise explain why
+6. Maximum 15 suggestions (focus on technical aspects)
+7. Skills section: max 18 total skills, grouped by category
+
+REMEMBER: The job description is the ONLY source of truth for requirements. The resume is what we're trying to align TO the job description, not the other way around.`;
 
   // Use timeout for analysis
   const analysisTimeout = ACTIVE_AI_PROVIDER === 'openai' ? OPENAI_ANALYSIS_TIMEOUT : OLLAMA_ANALYSIS_TIMEOUT;
@@ -2138,12 +2186,28 @@ CRITICAL:
  */
 async function handleChatMessage(message, currentDraft, jobText, chatHistory) {
   try {
-    // Retrieve relevant context from vector DB (allow more time for better results)
+    // Retrieve relevant context using OpenAI embeddings (if available)
     let context = [];
+    
+    // Create a session ID for chat (use a hash of jobText + currentDraft for consistency)
+    const chatSessionId = `chat_${Buffer.from(jobText + currentDraft).toString('base64').substring(0, 20)}`;
+    
+    // Store job and draft chunks if not already stored
+    if (!vectorStore.has(chatSessionId)) {
+      try {
+        await Promise.all([
+          storeJobChunks(chatSessionId, jobText, 'chat_job'),
+          storeResumeChunks(chatSessionId, currentDraft, 'chat_resume')
+        ]);
+      } catch (error) {
+        console.warn('Could not store chunks for chat:', error.message);
+      }
+    }
+    
     try {
       const queryText = `${message} ${jobText}`;
       // Add timeout to RAG retrieval - max 10 seconds (allow time for better context)
-      const ragPromise = retrieveSimilarContent(queryText, 5); // Get more results for better AI context
+      const ragPromise = retrieveSimilarContent(chatSessionId, queryText, 5); // Get more results for better AI context
       const timeoutPromise = new Promise((_, reject) => 
         setTimeout(() => reject(new Error('RAG timeout')), 10000)
       );
@@ -2635,11 +2699,16 @@ async function checkOllamaHealth(maxWaitSeconds = 30) {
 // Initialize and start server
 async function startServer() {
   try {
-    // Initialize embedding model
-    await initializeEmbeddingModel();
+    // Check OpenAI availability (required for embeddings)
+    if (!openaiClient) {
+      console.warn('⚠️  OpenAI client not initialized. RAG features will be disabled.');
+      console.warn('   Please set OPENAI_API_KEY environment variable to enable RAG.');
+    } else {
+      console.log('✅ OpenAI client ready for embeddings and RAG');
+    }
     
-    // Check Ollama health and wait for it (critical for this project)
-    if (USE_OLLAMA) {
+    // Check Ollama health and wait for it (if using Ollama)
+    if (USE_OLLAMA && ACTIVE_AI_PROVIDER !== 'openai') {
       console.log('🔍 Checking Ollama health...');
       await checkOllamaHealth(30); // Wait up to 30 seconds for Ollama
       if (!ollamaHealthy) {
@@ -2650,62 +2719,23 @@ async function startServer() {
       }
     }
     
-    // Test vector DB connection with timeout and retry
-    console.log('🔍 Checking ChromaDB connection...');
-    let chromaConnected = false;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const heartbeatPromise = chromaClient.heartbeat();
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Connection timeout')), 5000)
-      );
-      
-      await Promise.race([heartbeatPromise, timeoutPromise]);
-      chromaAvailable = true;
-        chromaConnected = true;
-      await getOrCreateCollection();
-      console.log('✅ Vector database (ChromaDB) connected');
-        break;
-    } catch (error) {
-        console.warn(`⚠️  ChromaDB connection attempt ${attempt}/3 failed: ${error.message}`);
-        if (attempt < 3) {
-          console.log(`   Retrying in 2 seconds...`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-      }
-    }
-    
-    if (!chromaConnected) {
-      chromaAvailable = false;
-      console.warn('⚠️  Vector database (ChromaDB) not available after 3 attempts');
-      console.warn('   Service will continue but RAG features will be limited');
-      console.warn('   To enable: docker run -d -p 8000:8000 chromadb/chroma');
-      console.warn('   The service will automatically reconnect when ChromaDB becomes available');
-    }
-    
-    // Start periodic health check for ChromaDB (every 30 seconds)
-    setInterval(async () => {
-      if (!chromaAvailable) {
-        console.log('🔄 Checking ChromaDB availability...');
-        await checkChromaHealth();
-      }
-    }, 30000); // Check every 30 seconds
-    
     // Display configuration
     console.log('\n📋 Configuration:');
     console.log(`   AI Provider: ${ACTIVE_AI_PROVIDER === 'openai' ? '✅ OpenAI' : '✅ Ollama'}`);
     if (ACTIVE_AI_PROVIDER === 'openai') {
       console.log(`   OpenAI Model: ${OPENAI_MODEL}`);
       console.log(`   OpenAI API Key: ${OPENAI_API_KEY ? '✅ Set' : '❌ Not set'}`);
+      console.log(`   Embeddings: ✅ OpenAI (${OPENAI_EMBEDDING_MODEL})`);
+      console.log(`   RAG: ${openaiClient ? '✅ Enabled (in-memory vector store)' : '❌ Disabled (no API key)'}`);
     } else {
-    console.log(`   Ollama: ${USE_OLLAMA ? (ollamaHealthy ? '✅ Healthy' : '❌ Not available') : '❌ Disabled'}`);
-    if (USE_OLLAMA) {
-      console.log(`   Ollama URL: ${OLLAMA_URL}`);
-      console.log(`   Ollama Model: ${OLLAMA_MODEL}`);
+      console.log(`   Ollama: ${USE_OLLAMA ? (ollamaHealthy ? '✅ Healthy' : '❌ Not available') : '❌ Disabled'}`);
+      if (USE_OLLAMA) {
+        console.log(`   Ollama URL: ${OLLAMA_URL}`);
+        console.log(`   Ollama Model: ${OLLAMA_MODEL}`);
       }
+      console.log(`   Embeddings: ${openaiClient ? `✅ OpenAI (${OPENAI_EMBEDDING_MODEL})` : '❌ Not available (no OpenAI API key)'}`);
+      console.log(`   RAG: ${openaiClient ? '✅ Enabled (in-memory vector store)' : '❌ Disabled (no OpenAI API key)'}`);
     }
-    console.log(`   Vector DB: ${chromaAvailable ? '✅ Connected' : '❌ Not available'}`);
-    console.log(`   Embeddings: ✅ Local (Xenova/all-MiniLM-L6-v2)\n`);
     
     app.listen(PORT, () => {
       console.log(`🚀 ResumeFit AI Service running on http://localhost:${PORT}`);
