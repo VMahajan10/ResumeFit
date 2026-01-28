@@ -5,6 +5,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
+import puppeteer from 'puppeteer';
 
 dotenv.config();
 
@@ -1153,6 +1154,134 @@ async function generateFallbackResponse(prompt) {
 }
 
 /**
+ * Check if a keyword is a technical term (not a common word)
+ */
+function isTechnicalKeyword(keyword) {
+  if (!keyword || typeof keyword !== 'string') return false;
+  
+  const kw = keyword.trim();
+  if (kw.length < 2) return false;
+  
+  // Common stop words to exclude
+  const stopWords = new Set([
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+    'from', 'as', 'is', 'was', 'are', 'were', 'been', 'be', 'have', 'has', 'had', 'do', 'does', 'did',
+    'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those',
+    'it', 'its', 'they', 'them', 'their', 'there', 'then', 'than', 'when', 'where', 'what', 'which', 'who',
+    'how', 'why', 'if', 'else', 'while', 'during', 'after', 'before', 'about', 'into', 'onto', 'upon',
+    'applicants', 'should', 'demonstrate', 'depth', 'knowledge', 'conduct', 'research', 'leads', 'collaborations',
+    'formulate', 'problems', 'area', 'study', 'work', 'experience', 'years', 'required', 'preferred', 'must',
+    'have', 'need', 'ability', 'skills', 'qualifications', 'responsibilities', 'duties', 'tasks', 'projects',
+    'team', 'company', 'organization', 'position', 'role', 'job', 'career', 'professional', 'development'
+  ]);
+  
+  if (stopWords.has(kw.toLowerCase())) return false;
+  
+  // Check if it looks like a technical term:
+  // - Programming languages (Python, Java, JavaScript, etc.)
+  // - Frameworks (React, Django, Spring, etc.)
+  // - Tools (Docker, Kubernetes, AWS, etc.)
+  // - Technologies (SQL, NoSQL, REST, etc.)
+  // - Certifications (AWS Certified, PMP, etc.)
+  // - Methodologies (Agile, Scrum, CI/CD, etc.)
+  
+  // Common technical patterns
+  const techPatterns = [
+    /^[A-Z][a-z]+$/,  // Capitalized word (Python, React, Docker)
+    /^[A-Z]{2,}$/,     // All caps acronym (AWS, API, SQL, REST)
+    /^[a-z]+[A-Z]/,    // camelCase (JavaScript, TypeScript)
+    /\d+/,             // Contains numbers (Python 3.8, Java 11)
+    /\+/,              // Contains + (C++, .NET+)
+    /\./,              // Contains . (.NET, Node.js)
+    /#/,               // Contains # (C#)
+    /-/,               // Contains - (CI/CD, machine-learning)
+  ];
+  
+  // Check if it matches technical patterns
+  const matchesTechPattern = techPatterns.some(pattern => pattern.test(kw));
+  
+  // Minimum length for technical terms (usually 3+ chars, but allow 2 for things like "AI", "ML", "UI", "UX")
+  const minLength = kw.length >= 2;
+  
+  return minLength && matchesTechPattern;
+}
+
+/**
+ * Extract technical keywords from text
+ * Returns a Set of technical keywords found
+ */
+function extractTechnicalKeywords(text) {
+  if (!text || typeof text !== 'string') return new Set();
+  
+  const keywords = new Set();
+  const lowerText = text.toLowerCase();
+  
+  // Common technical keywords to look for
+  const techKeywords = [
+    // Programming Languages
+    'python', 'java', 'javascript', 'typescript', 'c++', 'c#', 'go', 'rust', 'kotlin', 'swift',
+    'php', 'ruby', 'scala', 'r', 'matlab', 'perl', 'shell', 'bash', 'powershell',
+    // Web Technologies
+    'html', 'css', 'react', 'angular', 'vue', 'node.js', 'express', 'django', 'flask', 'spring',
+    'asp.net', 'laravel', 'rails', 'next.js', 'nuxt.js', 'svelte',
+    // Databases
+    'sql', 'postgresql', 'mysql', 'mongodb', 'redis', 'cassandra', 'elasticsearch', 'dynamodb',
+    'oracle', 'sqlite', 'mariadb', 'neo4j', 'couchdb',
+    // Cloud & DevOps
+    'aws', 'azure', 'gcp', 'google cloud', 'docker', 'kubernetes', 'terraform', 'ansible',
+    'jenkins', 'gitlab', 'github actions', 'ci/cd', 'devops', 'microservices',
+    // Tools & Frameworks
+    'git', 'svn', 'jira', 'confluence', 'slack', 'docker', 'kubernetes', 'terraform',
+    'ansible', 'puppet', 'chef', 'vagrant', 'prometheus', 'grafana', 'splunk',
+    // Data & Analytics
+    'spark', 'hadoop', 'kafka', 'airflow', 'pandas', 'numpy', 'tensorflow', 'pytorch',
+    'scikit-learn', 'keras', 'jupyter', 'tableau', 'power bi', 'looker',
+    // Methodologies
+    'agile', 'scrum', 'kanban', 'lean', 'waterfall', 'ci/cd', 'tdd', 'bdd',
+    // Certifications
+    'aws certified', 'azure certified', 'gcp certified', 'pmp', 'cissp', 'itil',
+    // Other Technologies
+    'rest', 'graphql', 'grpc', 'soap', 'microservices', 'api', 'sdk', 'sso', 'oauth',
+    'machine learning', 'deep learning', 'nlp', 'computer vision', 'data science',
+    'big data', 'data engineering', 'etl', 'data pipeline'
+  ];
+  
+  // Check for exact matches (case-insensitive)
+  techKeywords.forEach(tech => {
+    const regex = new RegExp(`\\b${tech.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    if (regex.test(text)) {
+      // Capitalize appropriately
+      if (tech.includes('/')) {
+        keywords.add(tech.toUpperCase()); // CI/CD, TDD, etc.
+      } else if (tech.length <= 4 && tech !== 'java' && tech !== 'rust' && tech !== 'go') {
+        keywords.add(tech.toUpperCase()); // SQL, API, AWS, etc.
+      } else {
+        // Capitalize first letter
+        keywords.add(tech.charAt(0).toUpperCase() + tech.slice(1));
+      }
+    }
+  });
+  
+  // Also extract capitalized words that look technical (3+ chars, not common words)
+  const words = text.match(/\b[A-Z][a-z]{2,}\b/g) || [];
+  words.forEach(word => {
+    if (isTechnicalKeyword(word)) {
+      keywords.add(word);
+    }
+  });
+  
+  // Extract acronyms (2-5 uppercase letters)
+  const acronyms = text.match(/\b[A-Z]{2,5}\b/g) || [];
+  acronyms.forEach(acronym => {
+    if (isTechnicalKeyword(acronym)) {
+      keywords.add(acronym);
+    }
+  });
+  
+  return keywords;
+}
+
+/**
  * Analyze resume with RAG
  */
 async function analyzeResume(resumeText, jobText) {
@@ -1410,8 +1539,8 @@ CRITICAL REQUIREMENTS - YOU MUST FOLLOW THESE EXACTLY:
 Return exactly this JSON structure:
 {
   "score": <number 0-100>,
-  "matched_keywords": [<array of strings>],
-  "missing_keywords": [<array of strings>],
+  "matched_keywords": [<array of TECHNICAL keywords ONLY - programming languages, frameworks, tools, platforms, technologies found in BOTH job and resume. Examples: "Python", "React", "AWS", "Docker", "PostgreSQL". DO NOT include common words like "applicants", "should", "demonstrate", "knowledge", etc.>],
+  "missing_keywords": [<array of TECHNICAL keywords ONLY - programming languages, frameworks, tools, platforms, technologies in job but NOT in resume. Examples: "Kubernetes", "TypeScript", "MongoDB", "Terraform". DO NOT include common words like "applicants", "should", "demonstrate", "knowledge", etc.>],
   "suggested_edits": [
     {
       "section": "summary" | "experience" | "skills",
@@ -1930,6 +2059,8 @@ This is REJECTED because:
 You MUST return a JSON object with this EXACT structure:
 
 {
+  "matched_keywords": [<array of TECHNICAL keywords ONLY - programming languages, frameworks, tools, platforms, technologies found in BOTH job and resume. Examples: "Python", "React", "AWS", "Docker", "PostgreSQL". DO NOT include common words like "applicants", "should", "demonstrate", "knowledge", etc.>],
+  "missing_keywords": [<array of TECHNICAL keywords ONLY - programming languages, frameworks, tools, platforms, technologies in job but NOT in resume. Examples: "Kubernetes", "TypeScript", "MongoDB", "Terraform". DO NOT include common words like "applicants", "should", "demonstrate", "knowledge", etc.>],
   "top_alignment_gaps": [
     {
       "job_requirement": "Exact quote from job description (full technical requirement, no word limit)",
@@ -2047,16 +2178,71 @@ REMEMBER: The job description is the ONLY source of truth for requirements. The 
         job_keywords_addressed: edit.job_keywords_addressed || []
       }));
       
-      // Extract keywords from gaps and edits
-      const missing_keywords = [];
-      const matched_keywords = [];
+      // Extract technical keywords - prioritize AI-provided keywords, then extract from text
+      let matched_keywords = new Set();
+      let missing_keywords = new Set();
       
-      if (parsed.top_alignment_gaps && Array.isArray(parsed.top_alignment_gaps)) {
-        parsed.top_alignment_gaps.forEach(gap => {
-          // Extract keywords from evidence
-          const evidence = gap.evidence_from_job || '';
-          const keywords = evidence.split(/\s+/).filter(w => w.length > 2 && !['the', 'and', 'or', 'with', 'for'].includes(w.toLowerCase()));
-          missing_keywords.push(...keywords.slice(0, 5));
+      // First, use AI-provided keywords if available (filter to ensure they're technical)
+      if (parsed.matched_keywords && Array.isArray(parsed.matched_keywords)) {
+        parsed.matched_keywords.forEach(kw => {
+          if (isTechnicalKeyword(kw)) {
+            matched_keywords.add(kw);
+          }
+        });
+      }
+      
+      if (parsed.missing_keywords && Array.isArray(parsed.missing_keywords)) {
+        parsed.missing_keywords.forEach(kw => {
+          if (isTechnicalKeyword(kw)) {
+            missing_keywords.add(kw);
+          }
+        });
+      }
+      
+      // If AI didn't provide keywords or provided too few, extract from text
+      if (matched_keywords.size < 5 || missing_keywords.size < 5) {
+        // Extract from resume_edits - these contain actual technical keywords
+        if (suggested_edits && Array.isArray(suggested_edits)) {
+          suggested_edits.forEach(edit => {
+            if (edit.job_keywords_addressed && Array.isArray(edit.job_keywords_addressed)) {
+              edit.job_keywords_addressed.forEach(kw => {
+                if (isTechnicalKeyword(kw)) {
+                  missing_keywords.add(kw);
+                }
+              });
+            }
+          });
+        }
+        
+        // Also extract from top_alignment_gaps if available
+        if (parsed.top_alignment_gaps && Array.isArray(parsed.top_alignment_gaps)) {
+          parsed.top_alignment_gaps.forEach(gap => {
+            if (gap.job_keywords_addressed && Array.isArray(gap.job_keywords_addressed)) {
+              gap.job_keywords_addressed.forEach(kw => {
+                if (isTechnicalKeyword(kw)) {
+                  missing_keywords.add(kw);
+                }
+              });
+            }
+          });
+        }
+        
+        // Extract matched keywords from job description and resume
+        const jobTechKeywords = extractTechnicalKeywords(jobText);
+        const resumeTechKeywords = extractTechnicalKeywords(resumeText);
+        
+        // Matched keywords = technical terms found in both
+        jobTechKeywords.forEach(kw => {
+          if (resumeTechKeywords.has(kw)) {
+            matched_keywords.add(kw);
+          }
+        });
+        
+        // Missing keywords = technical terms in job but not in resume
+        jobTechKeywords.forEach(kw => {
+          if (!resumeTechKeywords.has(kw)) {
+            missing_keywords.add(kw);
+          }
         });
       }
       
@@ -2067,8 +2253,8 @@ REMEMBER: The job description is the ONLY source of truth for requirements. The 
       
       const result = {
         score: score,
-        matched_keywords: matched_keywords,
-        missing_keywords: [...new Set(missing_keywords)],
+        matched_keywords: Array.from(matched_keywords).slice(0, 50), // Limit to top 50
+        missing_keywords: Array.from(missing_keywords).slice(0, 50), // Limit to top 50
         suggested_edits: suggested_edits,
         updated_draft: resumeText,
         // Include new format fields for future use
@@ -2135,17 +2321,33 @@ REMEMBER: The job description is the ONLY source of truth for requirements. The 
       const editCount = resume_edits.length;
       const score = Math.max(0, Math.min(100, 100 - (gapCount * 10) - (editCount * 5)));
       
-      const missing_keywords = [];
+      const missing_keywords = new Set();
+      
+      // Extract from gaps' job_keywords_addressed
       top_alignment_gaps.forEach(gap => {
-        const evidence = gap.evidence_from_job || '';
-        const keywords = evidence.split(/\s+/).filter(w => w.length > 2 && !['the', 'and', 'or', 'with', 'for'].includes(w.toLowerCase()));
-        missing_keywords.push(...keywords.slice(0, 5));
+        if (gap.job_keywords_addressed && Array.isArray(gap.job_keywords_addressed)) {
+          gap.job_keywords_addressed.forEach(kw => {
+            if (isTechnicalKeyword(kw)) {
+              missing_keywords.add(kw);
+            }
+          });
+        }
+      });
+      
+      // Also extract technical keywords from job description
+      const jobTechKeywords = extractTechnicalKeywords(jobText);
+      const resumeTechKeywords = extractTechnicalKeywords(resumeText);
+      
+      jobTechKeywords.forEach(kw => {
+        if (!resumeTechKeywords.has(kw)) {
+          missing_keywords.add(kw);
+        }
       });
       
       const result = {
         score: score,
         matched_keywords: [],
-        missing_keywords: [...new Set(missing_keywords)],
+        missing_keywords: Array.from(missing_keywords).slice(0, 50), // Limit to top 50
         suggested_edits: resume_edits,
         updated_draft: resumeText,
         top_alignment_gaps: top_alignment_gaps,
@@ -2623,7 +2825,306 @@ app.post('/api/chat', async (req, res) => {
 });
 
 /**
- * Store knowledge in vector DB
+ * Web scraping endpoint for job descriptions
+ * Uses Puppeteer to handle JavaScript-rendered content and expand hidden sections
+ */
+app.post('/api/scrape-job', async (req, res) => {
+  const startTime = Date.now();
+  let browser = null;
+  
+  try {
+    const { url } = req.body;
+    
+    if (!url) {
+      return res.status(400).json({
+        success: false,
+        error: 'url is required',
+      });
+    }
+    
+    // Validate URL
+    let jobUrl;
+    try {
+      jobUrl = new URL(url);
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid URL format',
+      });
+    }
+    
+    // Only allow http/https URLs
+    if (!['http:', 'https:'].includes(jobUrl.protocol)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Only http and https URLs are allowed',
+      });
+    }
+    
+    console.log(`🌐 Starting web scrape for: ${url}`);
+    
+    // Launch browser
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+      ],
+    });
+    
+    const page = await browser.newPage();
+    
+    // Set viewport and user agent
+    await page.setViewport({ width: 1920, height: 1080 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    
+    // Navigate to page with timeout
+    await page.goto(url, {
+      waitUntil: 'networkidle2',
+      timeout: 30000,
+    });
+    
+    // Wait for page to be fully loaded
+    await page.waitForTimeout(2000);
+    
+    // Expand "Show More" buttons and similar expandable sections
+    console.log('   Expanding hidden sections...');
+    const expandSelectors = [
+      'button:has-text("Show More")',
+      'button:has-text("Show more")',
+      'button:has-text("See More")',
+      'button:has-text("See more")',
+      'button:has-text("Read More")',
+      'button:has-text("Read more")',
+      '[aria-label*="more" i]',
+      '[aria-label*="expand" i]',
+      '.show-more',
+      '.see-more',
+      '[data-testid*="expand" i]',
+      '[data-testid*="more" i]',
+    ];
+    
+    for (const selector of expandSelectors) {
+      try {
+        const buttons = await page.$$(selector);
+        for (const button of buttons) {
+          try {
+            await button.click();
+            await page.waitForTimeout(500); // Wait for content to load
+          } catch (e) {
+            // Button might not be clickable, continue
+          }
+        }
+      } catch (e) {
+        // Selector might not exist, continue
+      }
+    }
+    
+    // Scroll to load lazy-loaded content
+    console.log('   Scrolling to load content...');
+    await page.evaluate(() => {
+      return new Promise((resolve) => {
+        let totalHeight = 0;
+        const distance = 100;
+        const timer = setInterval(() => {
+          const scrollHeight = document.body.scrollHeight;
+          window.scrollBy(0, distance);
+          totalHeight += distance;
+          
+          if (totalHeight >= scrollHeight) {
+            clearInterval(timer);
+            resolve();
+          }
+        }, 100);
+      });
+    });
+    
+    // Wait a bit more for any dynamic content
+    await page.waitForTimeout(1000);
+    
+    // Extract text using multiple strategies
+    console.log('   Extracting job description text...');
+    
+    // Strategy 1: Try job-specific selectors
+    const jobSelectors = [
+      '[data-testid*="job"]',
+      '.jobs-description-content__text',
+      '.jobs-box__html-content',
+      '#jobDescriptionText',
+      '.jobsearch-jobDescriptionText',
+      '.job-description',
+      '.job-details',
+      '#job-description',
+      '[class*="jobDescription"]',
+      '[id*="jobDescription"]',
+      '[class*="job-description"]',
+      '[id*="job-description"]',
+      'article',
+      '[role="main"]',
+      'main',
+      '.content',
+      '.main-content',
+    ];
+    
+    let jobText = '';
+    let foundWithSelector = false;
+    
+    for (const selector of jobSelectors) {
+      try {
+        const element = await page.$(selector);
+        if (element) {
+          const text = await page.evaluate((el) => el.textContent || el.innerText || '', element);
+          if (text && text.length > 200) {
+            jobText = text;
+            foundWithSelector = true;
+            console.log(`   ✅ Found content with selector: ${selector}`);
+            break;
+          }
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+    
+    // Strategy 2: Extract structured data (JSON-LD)
+    if (!foundWithSelector || jobText.length < 500) {
+      try {
+        const jsonLd = await page.evaluate(() => {
+          const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+          const jobPostings = [];
+          scripts.forEach((script) => {
+            try {
+              const data = JSON.parse(script.textContent);
+              if (data['@type'] === 'JobPosting' || data['@type'] === 'JobPosting') {
+                jobPostings.push(data);
+              }
+            } catch (e) {
+              // Not valid JSON
+            }
+          });
+          return jobPostings;
+        });
+        
+        if (jsonLd.length > 0) {
+          const jobPosting = jsonLd[0];
+          const structuredText = [
+            jobPosting.title,
+            jobPosting.description,
+            jobPosting.qualifications,
+            jobPosting.skills,
+            jobPosting.responsibilities,
+          ].filter(Boolean).join('\n\n');
+          
+          if (structuredText.length > jobText.length) {
+            jobText = structuredText;
+            console.log('   ✅ Found structured data (JSON-LD)');
+          }
+        }
+      } catch (e) {
+        // JSON-LD extraction failed, continue
+      }
+    }
+    
+    // Strategy 3: Extract main content area
+    if (!foundWithSelector || jobText.length < 500) {
+      try {
+        const mainContent = await page.evaluate(() => {
+          const main = document.querySelector('main') ||
+                      document.querySelector('[role="main"]') ||
+                      document.querySelector('article') ||
+                      document.querySelector('.content') ||
+                      document.querySelector('.main-content') ||
+                      document.body;
+          return main.textContent || main.innerText || '';
+        });
+        
+        if (mainContent && mainContent.length > jobText.length) {
+          jobText = mainContent;
+          console.log('   ✅ Extracted main content area');
+        }
+      } catch (e) {
+        // Main content extraction failed
+      }
+    }
+    
+    // Strategy 4: Get full page text as fallback
+    if (jobText.length < 200) {
+      try {
+        const fullText = await page.evaluate(() => {
+          // Remove unwanted elements
+          const unwanted = document.querySelectorAll('script, style, noscript, nav, header, footer, aside, .sidebar, .advertisement, .ads, .ad, .cookie-banner, .popup, .modal');
+          unwanted.forEach((el) => el.remove());
+          return document.body.textContent || document.body.innerText || '';
+        });
+        
+        if (fullText && fullText.length > jobText.length) {
+          jobText = fullText;
+          console.log('   ✅ Extracted full page text');
+        }
+      } catch (e) {
+        // Full text extraction failed
+      }
+    }
+    
+    // Clean up text
+    jobText = jobText
+      .replace(/\s+/g, ' ')
+      .replace(/\n\s*\n/g, '\n')
+      .trim();
+    
+    // Get page metadata
+    const pageTitle = await page.title();
+    const pageUrl = page.url();
+    
+    await browser.close();
+    browser = null;
+    
+    const duration = Math.round((Date.now() - startTime) / 1000);
+    
+    if (jobText.length < 100) {
+      console.log(`   ⚠️  Extracted text is too short (${jobText.length} chars)`);
+      return res.status(400).json({
+        success: false,
+        error: 'Could not extract sufficient job description text from the page',
+        pageTitle,
+        pageUrl,
+        extractedLength: jobText.length,
+      });
+    }
+    
+    console.log(`✅ Successfully scraped ${jobText.length} characters in ${duration}s`);
+    
+    res.json({
+      success: true,
+      jobText,
+      pageTitle,
+      pageUrl,
+      extractedLength: jobText.length,
+      durationSeconds: duration,
+    });
+  } catch (error) {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {
+        // Ignore close errors
+      }
+    }
+    
+    console.error('Web scraping error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Web scraping failed',
+      details: error.stack,
+    });
+  }
+});
+
+/**
+ * Store knowledge endpoint (deprecated - kept for backward compatibility)
  */
 app.post('/api/store', async (req, res) => {
   try {
@@ -2636,11 +3137,11 @@ app.post('/api/store', async (req, res) => {
       });
     }
     
-    const stored = await storeInVectorDB(text, metadata || {});
-    
+    // Note: Vector storage is now handled automatically during analysis
+    // This endpoint is kept for backward compatibility but doesn't do anything
     res.json({
-      success: stored,
-      message: stored ? 'Stored successfully' : 'Failed to store',
+      success: true,
+      message: 'Storage is now handled automatically during analysis',
     });
   } catch (error) {
     console.error('Store error:', error);
