@@ -84,6 +84,7 @@ async function generateEmbedding(text) {
  * Store chunks in in-memory vector store
  */
 async function storeInVectorStore(sessionId, chunks) {
+  const storeStartTime = Date.now();
   try {
     if (!openaiClient) {
       console.warn('⚠️  OpenAI client not available, skipping vector storage');
@@ -93,10 +94,12 @@ async function storeInVectorStore(sessionId, chunks) {
     // Generate embeddings for all chunks in parallel (with batching)
     const batchSize = 10;
     const storedChunks = [];
+    const embeddingStartTime = Date.now();
     
     for (let i = 0; i < chunks.length; i += batchSize) {
       const batch = chunks.slice(i, i + batchSize);
       const texts = batch.map(chunk => chunk.text);
+      const batchStartTime = Date.now();
       
       try {
         // Generate embeddings for batch
@@ -104,6 +107,11 @@ async function storeInVectorStore(sessionId, chunks) {
           model: OPENAI_EMBEDDING_MODEL,
           input: texts,
         });
+        
+        const batchDuration = Date.now() - batchStartTime;
+        if (batchDuration > 2000) {
+          console.log(`      🔄 Batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(chunks.length / batchSize)} (${batch.length} chunks) took ${Math.round(batchDuration / 1000)}s`);
+        }
         
         // Store chunks with embeddings
         batch.forEach((chunk, idx) => {
@@ -118,11 +126,21 @@ async function storeInVectorStore(sessionId, chunks) {
       }
     }
     
+    const embeddingDuration = Math.round((Date.now() - embeddingStartTime) / 1000);
+    if (embeddingDuration > 5) {
+      console.log(`      🔄 Total embedding generation: ${embeddingDuration}s for ${chunks.length} chunks`);
+    }
+    
     // Store in memory
     if (!vectorStore.has(sessionId)) {
       vectorStore.set(sessionId, { chunks: [] });
     }
     vectorStore.get(sessionId).chunks.push(...storedChunks);
+    
+    const totalDuration = Math.round((Date.now() - storeStartTime) / 1000);
+    if (totalDuration > 5) {
+      console.log(`      💾 Total storage time: ${totalDuration}s for ${chunks.length} chunks`);
+    }
     
     return true;
   } catch (error) {
@@ -135,6 +153,7 @@ async function storeInVectorStore(sessionId, chunks) {
  * Retrieve similar content from in-memory vector store
  */
 async function retrieveSimilarContent(sessionId, queryText, topK = 5, filterMetadata = null, timeoutMs = 5000) {
+  const retrievalStartTime = Date.now();
   try {
     if (!openaiClient) {
       return [];
@@ -146,12 +165,17 @@ async function retrieveSimilarContent(sessionId, queryText, topK = 5, filterMeta
     }
     
     // Generate query embedding
+    const embeddingStartTime = Date.now();
     const embeddingPromise = generateEmbedding(queryText);
     const embeddingTimeout = new Promise((_, reject) => 
       setTimeout(() => reject(new Error('Embedding generation timeout')), timeoutMs)
     );
     
     const queryEmbedding = await Promise.race([embeddingPromise, embeddingTimeout]);
+    const embeddingDuration = Date.now() - embeddingStartTime;
+    if (embeddingDuration > 1000) {
+      console.log(`      🔄 Embedding generation took ${Math.round(embeddingDuration / 1000)}s`);
+    }
     
     // Filter chunks by metadata if provided
     let chunksToSearch = sessionData.chunks;
@@ -1310,9 +1334,20 @@ async function analyzeResume(resumeText, jobText) {
   const storeStartTime = Date.now();
   
   // Run storage operations in parallel with timeout
+  const resumeStoreStartTime = Date.now();
+  const jobStoreStartTime = Date.now();
+  
   const storagePromise = Promise.all([
-    storeResumeChunks(sessionId, resumeText, resumeId),
-    storeJobChunks(sessionId, jobText, jobId)
+    storeResumeChunks(sessionId, resumeText, resumeId).then(chunks => {
+      const duration = Math.round((Date.now() - resumeStoreStartTime) / 1000);
+      console.log(`   ✅ Resume chunks stored in ${duration}s (${chunks.length} chunks)`);
+      return chunks;
+    }),
+    storeJobChunks(sessionId, jobText, jobId).then(chunks => {
+      const duration = Math.round((Date.now() - jobStoreStartTime) / 1000);
+      console.log(`   ✅ Job chunks stored in ${duration}s (${chunks.length} chunks)`);
+      return chunks;
+    })
   ]);
   
   const storageTimeout = new Promise((resolve) => {
@@ -1324,9 +1359,7 @@ async function analyzeResume(resumeText, jobText) {
   
   const [resumeChunks, jobChunks] = await Promise.race([storagePromise, storageTimeout]);
   const storeDuration = Math.round((Date.now() - storeStartTime) / 1000);
-  console.log(`✅ Chunks stored in ${storeDuration}s`);
-  console.log(`   - Resume chunks: ${resumeChunks.length}`);
-  console.log(`   - Job chunks: ${jobChunks.length}`);
+  console.log(`✅ Total storage time: ${storeDuration}s`);
   console.log(`${'-'.repeat(80)}\n`);
   
   // Use RAG to retrieve relevant sections
@@ -1438,14 +1471,21 @@ async function analyzeResume(resumeText, jobText) {
     .filter(line => resumeSectionKeywords.some(kw => line.toLowerCase().includes(kw)))
     .slice(0, 30); // Increased to process more sections for comprehensive analysis
   
-  // Process resume sections in parallel with timeout
-  const resumeSectionPromises = keyResumeSections.map(async (resumeSection) => {
+  // Process resume sections in parallel with timeout (reduced from 30 to 15 for performance)
+  const resumeSectionStartTime = Date.now();
+  console.log(`   📄 Processing ${keyResumeSections.length} resume sections...`);
+  const resumeSectionPromises = keyResumeSections.slice(0, 15).map(async (resumeSection, index) => {
+    const sectionStartTime = Date.now();
     try {
       const relevantJobRequirements = await Promise.race([
         retrieveRelevantJobRequirements(sessionId, resumeSection, 10), // Increased to get more comprehensive matches
         new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 5000))
       ]);
-    if (relevantJobRequirements.length > 0) {
+      const sectionDuration = Date.now() - sectionStartTime;
+      if (sectionDuration > 2000) {
+        console.log(`   ⏱️  Resume section ${index + 1}/${Math.min(keyResumeSections.length, 15)} took ${Math.round(sectionDuration / 1000)}s`);
+      }
+      if (relevantJobRequirements.length > 0) {
         return {
         resumeSection: resumeSection,
           relevantJobRequirements: relevantJobRequirements.join('\n\n---\n\n')
@@ -1453,12 +1493,15 @@ async function analyzeResume(resumeText, jobText) {
       }
       return null;
     } catch (error) {
-      console.warn(`RAG timeout for resume section: ${resumeSection.substring(0, 50)}...`);
+      const sectionDuration = Date.now() - sectionStartTime;
+      console.warn(`   ⚠️  RAG timeout for resume section ${index + 1} (${Math.round(sectionDuration / 1000)}s): ${resumeSection.substring(0, 50)}...`);
       return null;
     }
   });
   
   const resumeResults = await Promise.all(resumeSectionPromises);
+  const resumeSectionDuration = Math.round((Date.now() - resumeSectionStartTime) / 1000);
+  console.log(`   ✅ Resume sections processed in ${resumeSectionDuration}s (${resumeResults.filter(r => r !== null).length} matches)`);
   resumeResults.forEach(result => {
     if (result) relevantContexts.push(result);
   });
@@ -1474,13 +1517,20 @@ async function analyzeResume(resumeText, jobText) {
     .filter(line => jobRequirementKeywords.some(kw => line.toLowerCase().includes(kw)))
     .slice(0, 50); // Increased to process more requirements for comprehensive analysis
   
-  // Process job requirements in parallel with timeout
-  const jobRequirementPromises = keyJobRequirements.map(async (requirement) => {
+  // Process job requirements in parallel with timeout (reduced from 50 to 25 for performance)
+  const jobRequirementStartTime = Date.now();
+  console.log(`   📋 Processing ${keyJobRequirements.length} job requirements...`);
+  const jobRequirementPromises = keyJobRequirements.slice(0, 25).map(async (requirement, index) => {
+    const reqStartTime = Date.now();
     try {
       const relevantResumeSections = await Promise.race([
         retrieveRelevantResumeSections(sessionId, requirement, 10), // Increased to get more comprehensive matches
         new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 5000))
       ]);
+      const reqDuration = Date.now() - reqStartTime;
+      if (reqDuration > 2000) {
+        console.log(`   ⏱️  Job requirement ${index + 1}/${Math.min(keyJobRequirements.length, 25)} took ${Math.round(reqDuration / 1000)}s`);
+      }
       if (relevantResumeSections.length > 0) {
         return {
           jobRequirement: requirement,
@@ -1489,12 +1539,15 @@ async function analyzeResume(resumeText, jobText) {
       }
       return null;
     } catch (error) {
-      console.warn(`RAG timeout for job requirement: ${requirement.substring(0, 50)}...`);
+      const reqDuration = Date.now() - reqStartTime;
+      console.warn(`   ⚠️  RAG timeout for job requirement ${index + 1} (${Math.round(reqDuration / 1000)}s): ${requirement.substring(0, 50)}...`);
       return null;
     }
   });
   
   const jobResults = await Promise.all(jobRequirementPromises);
+  const jobRequirementDuration = Math.round((Date.now() - jobRequirementStartTime) / 1000);
+  console.log(`   ✅ Job requirements processed in ${jobRequirementDuration}s (${jobResults.filter(r => r !== null).length} matches)`);
   jobResults.forEach(result => {
     if (result) relevantContexts.push(result);
   });
@@ -2263,34 +2316,60 @@ REMEMBER: The job description is the ONLY source of truth for requirements. The 
         ignored_noise: parsed.ignored_noise || []
       };
       
-      // Log final summary
+      // Log final summary with detailed breakdown
       const totalDuration = Math.round((Date.now() - analysisStartTime) / 1000);
       const parseDuration = Math.round((Date.now() - aiStartTime - aiDuration) / 1000);
+      const storageTime = Math.round((storeStartTime - analysisStartTime) / 1000);
+      const ragTime = ragDuration;
+      const aiTime = aiDuration;
+      const otherTime = totalDuration - storageTime - ragTime - aiTime - parseDuration;
+      
       console.log(`${'='.repeat(80)}`);
       console.log(`✅ ANALYSIS COMPLETED SUCCESSFULLY`);
       console.log(`${'='.repeat(80)}`);
       console.log(`⏱️  Total time: ${totalDuration} seconds (${Math.round(totalDuration / 60)} minutes)`);
-      console.log(`   - Storage: ${Math.round((storeStartTime - analysisStartTime) / 1000)}s`);
-      console.log(`   - RAG retrieval: ${ragDuration}s`);
-      console.log(`   - AI processing: ${aiDuration}s`);
-      console.log(`   - Parsing: ${parseDuration}s`);
+      console.log(`   📊 Time Breakdown:`);
+      console.log(`      - Storage (embeddings): ${storageTime}s (${Math.round(storageTime / totalDuration * 100)}%)`);
+      console.log(`      - RAG retrieval: ${ragTime}s (${Math.round(ragTime / totalDuration * 100)}%)`);
+      console.log(`      - AI processing: ${aiTime}s (${Math.round(aiTime / totalDuration * 100)}%)`);
+      console.log(`      - Parsing: ${parseDuration}s (${Math.round(parseDuration / totalDuration * 100)}%)`);
+      if (otherTime > 0) {
+        console.log(`      - Other: ${otherTime}s (${Math.round(otherTime / totalDuration * 100)}%)`);
+      }
+      console.log(`   📈 Results:`);
+      console.log(`      - Matched keywords: ${result.matched_keywords.length}`);
+      console.log(`      - Missing keywords: ${result.missing_keywords.length}`);
+      console.log(`      - Suggested edits: ${result.suggested_edits.length}`);
       console.log(`⏰ End time: ${new Date().toISOString()}`);
       console.log(`${'='.repeat(80)}\n`);
       
       return result;
     } else if (parsed.suggested_edits) {
       // Old format - return as is
-      // Log final summary
+      // Log final summary with detailed breakdown
       const totalDuration = Math.round((Date.now() - analysisStartTime) / 1000);
       const parseDuration = Math.round((Date.now() - aiStartTime - aiDuration) / 1000);
+      const storageTime = Math.round((storeStartTime - analysisStartTime) / 1000);
+      const ragTime = ragDuration;
+      const aiTime = aiDuration;
+      const otherTime = totalDuration - storageTime - ragTime - aiTime - parseDuration;
+      
       console.log(`${'='.repeat(80)}`);
       console.log(`✅ ANALYSIS COMPLETED SUCCESSFULLY`);
       console.log(`${'='.repeat(80)}`);
       console.log(`⏱️  Total time: ${totalDuration} seconds (${Math.round(totalDuration / 60)} minutes)`);
-      console.log(`   - Storage: ${Math.round((storeStartTime - analysisStartTime) / 1000)}s`);
-      console.log(`   - RAG retrieval: ${ragDuration}s`);
-      console.log(`   - AI processing: ${aiDuration}s`);
-      console.log(`   - Parsing: ${parseDuration}s`);
+      console.log(`   📊 Time Breakdown:`);
+      console.log(`      - Storage (embeddings): ${storageTime}s (${Math.round(storageTime / totalDuration * 100)}%)`);
+      console.log(`      - RAG retrieval: ${ragTime}s (${Math.round(ragTime / totalDuration * 100)}%)`);
+      console.log(`      - AI processing: ${aiTime}s (${Math.round(aiTime / totalDuration * 100)}%)`);
+      console.log(`      - Parsing: ${parseDuration}s (${Math.round(parseDuration / totalDuration * 100)}%)`);
+      if (otherTime > 0) {
+        console.log(`      - Other: ${otherTime}s (${Math.round(otherTime / totalDuration * 100)}%)`);
+      }
+      console.log(`   📈 Results:`);
+      console.log(`      - Matched keywords: ${parsed.matched_keywords?.length || 0}`);
+      console.log(`      - Missing keywords: ${parsed.missing_keywords?.length || 0}`);
+      console.log(`      - Suggested edits: ${parsed.suggested_edits?.length || 0}`);
       console.log(`⏰ End time: ${new Date().toISOString()}`);
       console.log(`${'='.repeat(80)}\n`);
       
@@ -2355,17 +2434,30 @@ REMEMBER: The job description is the ONLY source of truth for requirements. The 
         ignored_noise: parsed.ignored_noise || []
       };
       
-      // Log final summary
+      // Log final summary with detailed breakdown
       const totalDuration = Math.round((Date.now() - analysisStartTime) / 1000);
       const parseDuration = Math.round((Date.now() - aiStartTime - aiDuration) / 1000);
+      const storageTime = Math.round((storeStartTime - analysisStartTime) / 1000);
+      const ragTime = ragDuration;
+      const aiTime = aiDuration;
+      const otherTime = totalDuration - storageTime - ragTime - aiTime - parseDuration;
+      
       console.log(`${'='.repeat(80)}`);
       console.log(`✅ ANALYSIS COMPLETED SUCCESSFULLY`);
       console.log(`${'='.repeat(80)}`);
       console.log(`⏱️  Total time: ${totalDuration} seconds (${Math.round(totalDuration / 60)} minutes)`);
-      console.log(`   - Storage: ${Math.round((storeStartTime - analysisStartTime) / 1000)}s`);
-      console.log(`   - RAG retrieval: ${ragDuration}s`);
-      console.log(`   - AI processing: ${aiDuration}s`);
-      console.log(`   - Parsing: ${parseDuration}s`);
+      console.log(`   📊 Time Breakdown:`);
+      console.log(`      - Storage (embeddings): ${storageTime}s (${Math.round(storageTime / totalDuration * 100)}%)`);
+      console.log(`      - RAG retrieval: ${ragTime}s (${Math.round(ragTime / totalDuration * 100)}%)`);
+      console.log(`      - AI processing: ${aiTime}s (${Math.round(aiTime / totalDuration * 100)}%)`);
+      console.log(`      - Parsing: ${parseDuration}s (${Math.round(parseDuration / totalDuration * 100)}%)`);
+      if (otherTime > 0) {
+        console.log(`      - Other: ${otherTime}s (${Math.round(otherTime / totalDuration * 100)}%)`);
+      }
+      console.log(`   📈 Results:`);
+      console.log(`      - Matched keywords: ${result.matched_keywords.length}`);
+      console.log(`      - Missing keywords: ${result.missing_keywords.length}`);
+      console.log(`      - Suggested edits: ${result.suggested_edits.length}`);
       console.log(`⏰ End time: ${new Date().toISOString()}`);
       console.log(`${'='.repeat(80)}\n`);
       
