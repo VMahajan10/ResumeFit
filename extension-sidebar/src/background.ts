@@ -278,7 +278,39 @@ async function handleExtractJob(
       };
     }
 
-    // Inject content script if needed and request extraction
+    // Strategy 1: Try server-side web scraping (handles JavaScript-rendered content, expands "Show More" buttons, etc.)
+    if (USE_CUSTOM_AI_SERVICE) {
+      try {
+        console.log('🌐 Attempting server-side web scraping...');
+        const scrapeResponse = await fetch(`${AI_SERVICE_BASE_URL}/api/scrape-job`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ url }),
+        });
+
+        if (scrapeResponse.ok) {
+          const scrapeData = await scrapeResponse.json();
+          if (scrapeData.success && scrapeData.jobText && scrapeData.jobText.length > 100) {
+            console.log(`✅ Server-side scraping successful: ${scrapeData.jobText.length} characters extracted`);
+            return {
+              success: true,
+              jobText: scrapeData.jobText,
+              jobUrl: scrapeData.pageUrl || url,
+            };
+          }
+        } else {
+          console.log(`⚠️  Server-side scraping failed (${scrapeResponse.status}), falling back to client-side extraction`);
+        }
+      } catch (scrapeError) {
+        console.log('⚠️  Server-side scraping error, falling back to client-side extraction:', scrapeError);
+        // Continue to fallback strategy
+      }
+    }
+
+    // Strategy 2: Fallback to client-side extraction (for pages that don't need JavaScript rendering)
+    console.log('📄 Using client-side text extraction...');
     const results = await chrome.scripting.executeScript({
       target: { tabId },
       func: extractPageText,
@@ -291,11 +323,12 @@ async function handleExtractJob(
       if (!text || text.trim().length < 50) {
         return {
           success: false,
-          error: 'Could not extract sufficient text from page. The page might be empty or still loading.',
+          error: 'Could not extract sufficient text from page. The page might be empty or still loading. Try using server-side scraping if the page has JavaScript-rendered content.',
           jobUrl: url,
         };
       }
 
+      console.log(`✅ Client-side extraction successful: ${text.length} characters extracted`);
       return {
         success: true,
         jobText: text,
@@ -303,10 +336,9 @@ async function handleExtractJob(
       };
     }
 
-
     return {
       success: false,
-      error: 'Failed to extract text from page. The page might not be fully loaded or accessible.',
+      error: 'Failed to extract text from page. The page might not be fully loaded or accessible. If the page uses JavaScript to load content, ensure the AI service is running for server-side scraping.',
       jobUrl: url,
     };
   } catch (error) {

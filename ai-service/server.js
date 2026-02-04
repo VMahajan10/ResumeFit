@@ -430,6 +430,11 @@ async function generateAIResponseForChat(prompt, context = '') {
     ? `${prompt}\n\nRelevant Context:\n${context}`
     : prompt;
   
+  console.log(`   📝 Prompt length: ${enhancedPrompt.length} chars`);
+  console.log(`   🔑 OpenAI client available: ${!!openaiClient}`);
+  console.log(`   🔑 ACTIVE_AI_PROVIDER: ${ACTIVE_AI_PROVIDER}`);
+  console.log(`   🔑 USE_OLLAMA: ${USE_OLLAMA}`);
+  
   // Primary: OpenAI (if API key is set)
   if (ACTIVE_AI_PROVIDER === 'openai' && openaiClient) {
     try {
@@ -444,17 +449,25 @@ async function generateAIResponseForChat(prompt, context = '') {
           content: enhancedPrompt
         }
       ];
-      return await callOpenAI(messages, OPENAI_CHAT_TIMEOUT);
+      const response = await callOpenAI(messages, OPENAI_CHAT_TIMEOUT);
+      console.log(`   ✅ OpenAI response received (${response.length} chars)`);
+      return response;
     } catch (error) {
       console.error('❌ OpenAI failed for chat:', error.message);
+      console.error('   Error details:', error);
       // Fall back to Ollama if available
-  if (USE_OLLAMA) {
+      if (USE_OLLAMA) {
         console.log('   🔄 Falling back to Ollama for chat...');
         try {
-          return await callOllamaWithRetry(enhancedPrompt, OLLAMA_CHAT_TIMEOUT);
+          const ollamaResponse = await callOllamaWithRetry(enhancedPrompt, OLLAMA_CHAT_TIMEOUT);
+          console.log(`   ✅ Ollama response received (${ollamaResponse.length} chars)`);
+          return ollamaResponse;
         } catch (ollamaError) {
-          console.warn('   Ollama also failed, using fallback...');
+          console.error('   ❌ Ollama also failed:', ollamaError.message);
+          console.warn('   🔄 Using fallback response...');
         }
+      } else {
+        console.warn('   ⚠️  Ollama not available, using fallback...');
       }
     }
   }
@@ -463,21 +476,27 @@ async function generateAIResponseForChat(prompt, context = '') {
   if (USE_OLLAMA) {
     try {
       console.log(`   🤖 Using Ollama (${OLLAMA_MODEL}) for chat...`);
-      return await callOllamaWithRetry(enhancedPrompt, OLLAMA_CHAT_TIMEOUT);
+      const response = await callOllamaWithRetry(enhancedPrompt, OLLAMA_CHAT_TIMEOUT);
+      console.log(`   ✅ Ollama response received (${response.length} chars)`);
+      return response;
     } catch (error) {
       console.error('❌ Ollama failed for chat after all retries:', error.message);
-      console.warn('   Attempting fallback for chat...');
+      console.warn('   🔄 Attempting fallback for chat...');
     }
   }
   
   // Fallback: Local transformers model
   try {
-    return await generateWithLocalLLM(enhancedPrompt);
+    console.log('   🤖 Attempting local LLM...');
+    const response = await generateWithLocalLLM(enhancedPrompt);
+    console.log(`   ✅ Local LLM response received (${response.length} chars)`);
+    return response;
   } catch (error) {
-    console.warn('Local LLM not available, trying fallback:', error.message);
+    console.warn('   ⚠️  Local LLM not available:', error.message);
   }
   
   // Last resort: Chat-specific fallback
+  console.warn('   ⚠️  All AI providers failed, using rule-based fallback');
   const messageMatch = prompt.match(/User's current message:\s*(.+)/);
   const userMessage = messageMatch ? messageMatch[1] : 'user request';
   const draftMatch = prompt.match(/Current Draft Resume:\s*([\s\S]*?)(?=Job Description:)/);
@@ -1465,25 +1484,26 @@ async function analyzeResume(resumeText, jobText) {
   const ragStartTime = Date.now();
   
   // Retrieve based on resume content - prioritize most important sections
+  // OPTIMIZED: Reduced from 15 to 5 sections to speed up analysis
   const resumeSectionKeywords = ['experience', 'skill', 'summary', 'education', 'project', 'work'];
   const keyResumeSections = resumeText.split('\n')
     .filter(l => l.trim().length > 20)
     .filter(line => resumeSectionKeywords.some(kw => line.toLowerCase().includes(kw)))
-    .slice(0, 30); // Increased to process more sections for comprehensive analysis
+    .slice(0, 10); // Reduced to 10 candidates, will process top 5
   
-  // Process resume sections in parallel with timeout (reduced from 30 to 15 for performance)
+  // Process resume sections in parallel with timeout (OPTIMIZED: reduced from 15 to 5 for performance)
   const resumeSectionStartTime = Date.now();
-  console.log(`   📄 Processing ${keyResumeSections.length} resume sections...`);
-  const resumeSectionPromises = keyResumeSections.slice(0, 15).map(async (resumeSection, index) => {
+  console.log(`   📄 Processing ${Math.min(keyResumeSections.length, 5)} resume sections (optimized for speed)...`);
+  const resumeSectionPromises = keyResumeSections.slice(0, 5).map(async (resumeSection, index) => {
     const sectionStartTime = Date.now();
     try {
       const relevantJobRequirements = await Promise.race([
-        retrieveRelevantJobRequirements(sessionId, resumeSection, 10), // Increased to get more comprehensive matches
-        new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 5000))
+        retrieveRelevantJobRequirements(sessionId, resumeSection, 5), // OPTIMIZED: Reduced from 10 to 5 results per query
+        new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 3000)) // OPTIMIZED: Reduced timeout from 5s to 3s
       ]);
       const sectionDuration = Date.now() - sectionStartTime;
-      if (sectionDuration > 2000) {
-        console.log(`   ⏱️  Resume section ${index + 1}/${Math.min(keyResumeSections.length, 15)} took ${Math.round(sectionDuration / 1000)}s`);
+      if (sectionDuration > 1000) {
+        console.log(`   ⏱️  Resume section ${index + 1}/${Math.min(keyResumeSections.length, 5)} took ${Math.round(sectionDuration / 1000)}s`);
       }
       if (relevantJobRequirements.length > 0) {
         return {
@@ -1494,7 +1514,7 @@ async function analyzeResume(resumeText, jobText) {
       return null;
     } catch (error) {
       const sectionDuration = Date.now() - sectionStartTime;
-      console.warn(`   ⚠️  RAG timeout for resume section ${index + 1} (${Math.round(sectionDuration / 1000)}s): ${resumeSection.substring(0, 50)}...`);
+      console.warn(`   ⚠️  RAG timeout for resume section ${index + 1}/${Math.min(keyResumeSections.length, 5)} (${Math.round(sectionDuration / 1000)}s): ${resumeSection.substring(0, 50)}...`);
       return null;
     }
   });
@@ -1515,21 +1535,21 @@ async function analyzeResume(resumeText, jobText) {
   const jobLines = jobText.split('\n').filter(l => l.trim().length > 20);
   const keyJobRequirements = jobLines
     .filter(line => jobRequirementKeywords.some(kw => line.toLowerCase().includes(kw)))
-    .slice(0, 50); // Increased to process more requirements for comprehensive analysis
+    .slice(0, 20); // OPTIMIZED: Reduced to 20 candidates, will process top 5
   
-  // Process job requirements in parallel with timeout (reduced from 50 to 25 for performance)
+  // Process job requirements in parallel with timeout (OPTIMIZED: reduced from 25 to 5 for performance)
   const jobRequirementStartTime = Date.now();
-  console.log(`   📋 Processing ${keyJobRequirements.length} job requirements...`);
-  const jobRequirementPromises = keyJobRequirements.slice(0, 25).map(async (requirement, index) => {
+  console.log(`   📋 Processing ${Math.min(keyJobRequirements.length, 5)} job requirements (optimized for speed)...`);
+  const jobRequirementPromises = keyJobRequirements.slice(0, 5).map(async (requirement, index) => {
     const reqStartTime = Date.now();
     try {
       const relevantResumeSections = await Promise.race([
-        retrieveRelevantResumeSections(sessionId, requirement, 10), // Increased to get more comprehensive matches
-        new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 5000))
+        retrieveRelevantResumeSections(sessionId, requirement, 5), // OPTIMIZED: Reduced from 10 to 5 results per query
+        new Promise((_, reject) => setTimeout(() => reject(new Error('RAG timeout')), 3000)) // OPTIMIZED: Reduced timeout from 5s to 3s
       ]);
       const reqDuration = Date.now() - reqStartTime;
-      if (reqDuration > 2000) {
-        console.log(`   ⏱️  Job requirement ${index + 1}/${Math.min(keyJobRequirements.length, 25)} took ${Math.round(reqDuration / 1000)}s`);
+      if (reqDuration > 1000) {
+        console.log(`   ⏱️  Job requirement ${index + 1}/${Math.min(keyJobRequirements.length, 5)} took ${Math.round(reqDuration / 1000)}s`);
       }
       if (relevantResumeSections.length > 0) {
         return {
@@ -1540,7 +1560,7 @@ async function analyzeResume(resumeText, jobText) {
       return null;
     } catch (error) {
       const reqDuration = Date.now() - reqStartTime;
-      console.warn(`   ⚠️  RAG timeout for job requirement ${index + 1} (${Math.round(reqDuration / 1000)}s): ${requirement.substring(0, 50)}...`);
+      console.warn(`   ⚠️  RAG timeout for job requirement ${index + 1}/${Math.min(keyJobRequirements.length, 5)} (${Math.round(reqDuration / 1000)}s): ${requirement.substring(0, 50)}...`);
       return null;
     }
   });
@@ -2632,25 +2652,46 @@ When proposing edits:
 CRITICAL: Every edit must be tied to a SPECIFIC requirement from the job description. Quote exact text from both documents. Keep response concise.`;
 
     // Generate response using AI (always wait for AI, no fast fallback)
+    console.log(`💬 Generating chat response for message: "${message.substring(0, 50)}..."`);
+    console.log(`   - Draft length: ${currentDraft.length} chars`);
+    console.log(`   - Job text length: ${jobText.length} chars`);
+    console.log(`   - Chat history: ${chatHistory.length} messages`);
+    console.log(`   - RAG context: ${context.length} items`);
+    
     let response;
     try {
       const contextText = Array.isArray(context) ? context.join('\n\n') : '';
       // Use full prompt for better AI responses (don't truncate)
+      console.log(`   🤖 Calling AI provider: ${ACTIVE_AI_PROVIDER}...`);
       response = await generateAIResponseForChat(userPrompt, contextText);
       
-      // If response is empty or invalid, retry once
       if (!response || response.trim().length === 0) {
-        console.warn('Empty AI response, retrying...');
+        console.warn('⚠️  Empty AI response, retrying...');
         response = await generateAIResponseForChat(userPrompt, contextText);
       }
+      
+      if (response && response.trim().length > 0) {
+        console.log(`   ✅ AI response received (${response.length} chars)`);
+      } else {
+        console.warn('⚠️  AI response still empty after retry, using fallback');
+        return generateChatFallbackResponse(message, currentDraft);
+      }
     } catch (error) {
-      console.error('Error generating AI response, retrying once:', error.message);
+      console.error('❌ Error generating AI response:', error.message);
+      console.error('   Stack:', error.stack);
       // Retry once before giving up
       try {
+        console.log('   🔄 Retrying AI call...');
         const contextText = Array.isArray(context) ? context.join('\n\n') : '';
         response = await generateAIResponseForChat(userPrompt, contextText);
+        if (response && response.trim().length > 0) {
+          console.log(`   ✅ Retry successful (${response.length} chars)`);
+        } else {
+          throw new Error('Empty response after retry');
+        }
       } catch (retryError) {
-        console.error('AI response failed after retry, using fallback:', retryError.message);
+        console.error('❌ AI response failed after retry:', retryError.message);
+        console.log('   🔄 Using fallback response');
         // Only use fallback as last resort
         return generateChatFallbackResponse(message, currentDraft);
       }
