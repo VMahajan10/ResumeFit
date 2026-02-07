@@ -1613,7 +1613,7 @@ Return exactly this JSON structure:
 {
   "score": <number 0-100>,
   "matched_keywords": [<array of TECHNICAL keywords ONLY - programming languages, frameworks, tools, platforms, technologies found in BOTH job and resume. Examples: "Python", "React", "AWS", "Docker", "PostgreSQL". DO NOT include common words like "applicants", "should", "demonstrate", "knowledge", etc.>],
-  "missing_keywords": [<array of TECHNICAL keywords ONLY - programming languages, frameworks, tools, platforms, technologies in job but NOT in resume. Examples: "Kubernetes", "TypeScript", "MongoDB", "Terraform". DO NOT include common words like "applicants", "should", "demonstrate", "knowledge", etc.>],
+  "missing_keywords": [<array of TECHNICAL keywords ONLY - programming languages, frameworks, tools, platforms, technologies that are EXPLICITLY in the job description but are COMPLETELY ABSENT from the resume. CRITICAL: Only include keywords that are truly missing - if a keyword appears anywhere in the resume (even once), it should NOT be in missing_keywords. Examples: "Kubernetes", "TypeScript", "MongoDB", "Terraform". DO NOT include common words like "applicants", "should", "demonstrate", "knowledge", etc.>],
   "suggested_edits": [
     {
       "section": "summary" | "experience" | "skills",
@@ -2133,7 +2133,7 @@ You MUST return a JSON object with this EXACT structure:
 
 {
   "matched_keywords": [<array of TECHNICAL keywords ONLY - programming languages, frameworks, tools, platforms, technologies found in BOTH job and resume. Examples: "Python", "React", "AWS", "Docker", "PostgreSQL". DO NOT include common words like "applicants", "should", "demonstrate", "knowledge", etc.>],
-  "missing_keywords": [<array of TECHNICAL keywords ONLY - programming languages, frameworks, tools, platforms, technologies in job but NOT in resume. Examples: "Kubernetes", "TypeScript", "MongoDB", "Terraform". DO NOT include common words like "applicants", "should", "demonstrate", "knowledge", etc.>],
+  "missing_keywords": [<array of TECHNICAL keywords ONLY - programming languages, frameworks, tools, platforms, technologies that are EXPLICITLY in the job description but are COMPLETELY ABSENT from the resume. CRITICAL: Only include keywords that are truly missing - if a keyword appears anywhere in the resume (even once), it should NOT be in missing_keywords. Examples: "Kubernetes", "TypeScript", "MongoDB", "Terraform". DO NOT include common words like "applicants", "should", "demonstrate", "knowledge", etc.>],
   "top_alignment_gaps": [
     {
       "job_requirement": "Exact quote from job description (full technical requirement, no word limit)",
@@ -2251,73 +2251,58 @@ REMEMBER: The job description is the ONLY source of truth for requirements. The 
         job_keywords_addressed: edit.job_keywords_addressed || []
       }));
       
-      // Extract technical keywords - prioritize AI-provided keywords, then extract from text
+      // Extract technical keywords - ALWAYS validate against resume to ensure accuracy
       let matched_keywords = new Set();
       let missing_keywords = new Set();
       
-      // First, use AI-provided keywords if available (filter to ensure they're technical)
+      // Extract all technical keywords from job and resume for comparison
+      const jobTechKeywords = extractTechnicalKeywords(jobText);
+      const resumeTechKeywords = extractTechnicalKeywords(resumeText);
+      
+      // Matched keywords = technical terms found in BOTH job and resume
+      jobTechKeywords.forEach(kw => {
+        if (resumeTechKeywords.has(kw)) {
+          matched_keywords.add(kw);
+        }
+      });
+      
+      // Missing keywords = technical terms in job but NOT in resume
+      // This is the SOURCE OF TRUTH - only keywords truly missing from resume
+      jobTechKeywords.forEach(kw => {
+        if (!resumeTechKeywords.has(kw)) {
+          missing_keywords.add(kw);
+        }
+      });
+      
+      // Validate AI-provided keywords against actual resume content
+      // Only use AI keywords if they pass validation
       if (parsed.matched_keywords && Array.isArray(parsed.matched_keywords)) {
         parsed.matched_keywords.forEach(kw => {
+          const normalizedKw = kw.toLowerCase().trim();
           if (isTechnicalKeyword(kw)) {
-            matched_keywords.add(kw);
+            // Only add if it's actually in both job and resume
+            if (jobTechKeywords.has(normalizedKw) && resumeTechKeywords.has(normalizedKw)) {
+              matched_keywords.add(kw);
+            }
           }
         });
       }
       
       if (parsed.missing_keywords && Array.isArray(parsed.missing_keywords)) {
         parsed.missing_keywords.forEach(kw => {
+          const normalizedKw = kw.toLowerCase().trim();
           if (isTechnicalKeyword(kw)) {
-            missing_keywords.add(kw);
+            // Only add if it's in job but NOT in resume (truly missing)
+            if (jobTechKeywords.has(normalizedKw) && !resumeTechKeywords.has(normalizedKw)) {
+              missing_keywords.add(kw);
+            }
           }
         });
       }
       
-      // If AI didn't provide keywords or provided too few, extract from text
-      if (matched_keywords.size < 5 || missing_keywords.size < 5) {
-        // Extract from resume_edits - these contain actual technical keywords
-        if (suggested_edits && Array.isArray(suggested_edits)) {
-          suggested_edits.forEach(edit => {
-            if (edit.job_keywords_addressed && Array.isArray(edit.job_keywords_addressed)) {
-              edit.job_keywords_addressed.forEach(kw => {
-                if (isTechnicalKeyword(kw)) {
-                  missing_keywords.add(kw);
-                }
-              });
-            }
-          });
-        }
-        
-        // Also extract from top_alignment_gaps if available
-        if (parsed.top_alignment_gaps && Array.isArray(parsed.top_alignment_gaps)) {
-          parsed.top_alignment_gaps.forEach(gap => {
-            if (gap.job_keywords_addressed && Array.isArray(gap.job_keywords_addressed)) {
-              gap.job_keywords_addressed.forEach(kw => {
-                if (isTechnicalKeyword(kw)) {
-                  missing_keywords.add(kw);
-                }
-              });
-            }
-          });
-        }
-        
-        // Extract matched keywords from job description and resume
-        const jobTechKeywords = extractTechnicalKeywords(jobText);
-        const resumeTechKeywords = extractTechnicalKeywords(resumeText);
-        
-        // Matched keywords = technical terms found in both
-        jobTechKeywords.forEach(kw => {
-          if (resumeTechKeywords.has(kw)) {
-            matched_keywords.add(kw);
-          }
-        });
-        
-        // Missing keywords = technical terms in job but not in resume
-        jobTechKeywords.forEach(kw => {
-          if (!resumeTechKeywords.has(kw)) {
-            missing_keywords.add(kw);
-          }
-        });
-      }
+      // DO NOT add keywords from job_keywords_addressed to missing_keywords
+      // These are keywords that edits are addressing, but they might already be in the resume
+      // The proper extraction above already handles this correctly
       
       // Calculate score based on gaps and edits
       const gapCount = parsed.top_alignment_gaps ? parsed.top_alignment_gaps.length : 0;
